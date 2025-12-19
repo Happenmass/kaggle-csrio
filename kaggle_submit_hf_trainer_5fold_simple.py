@@ -1,0 +1,1009 @@
+# %%
+"""
+Kaggle 提交示例（Trainer + Dataset，5-fold head ensemble，timm ViT 单独加载）
+
+你需要做的只有两件事：
+1) 把本文件顶部的全局路径变量改成你 Kaggle 实际的 /kaggle/input/... 目录
+2) 确保 5 个 fold 的 best head 权重已按 A 格式存在：
+   {HEAD_5FOLD_DIR}/fold0/model.safetensors
+   ...
+   {HEAD_5FOLD_DIR}/fold4/model.safetensors
+
+说明：
+- 这些 head safetensors 来自你训练脚本 train_hf_trainer.py（HF Trainer 保存的 model.safetensors）
+- 权重不包含 timm ViT，所以推理时会单独加载 ViT，并把 ViT 特征喂给 head
+- 推理使用 Trainer.predict(...)，并对 5 折输出做 simple mean
+"""
+
+# %%
+import os
+import sys
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+# =============================================================================
+# 重要：两卡模型并行 + Trainer 的 device 固定问题
+# -----------------------------------------------------------------------------
+# 现象：在多 GPU 环境里，Trainer/Accelerate 往往会把“模型设备”固定成 cuda:0，
+# 即使你手动 .to(cuda:1)，某些参数仍会被搬回 cuda:0，从而与我们手动搬运 token 冲突。
+#
+# 解决：在 import torch 之前重映射 CUDA_VISIBLE_DEVICES：
+# - 让 Trainer 看到的 cuda:0 实际对应物理 GPU1（用来放 head）
+# - cuda:1 实际对应物理 GPU0（用来放 ViT backbone）
+#
+# 注意：如果你在 notebook 里已经 import 过 torch，再设置 CUDA_VISIBLE_DEVICES 无效，
+# 需要“重启 kernel”后再运行。
+# =============================================================================
+
+# 是否启用“模型并行”
+USE_MODEL_PARALLEL = True
+
+# 是否启用 CUDA_VISIBLE_DEVICES 重映射（强烈建议开启以兼容 Trainer）
+REMAP_CUDA_VISIBLE_DEVICES_FOR_TRAINER = True
+CUDA_VISIBLE_DEVICES_REMAP = "1,0"  # 逻辑 cuda:0=物理GPU1(head), cuda:1=物理GPU0(backbone)
+
+if USE_MODEL_PARALLEL and REMAP_CUDA_VISIBLE_DEVICES_FOR_TRAINER:
+    if "torch" in sys.modules:
+        print(
+            "[WARN] torch 已导入，CUDA_VISIBLE_DEVICES 重映射可能无效；"
+            "请重启 kernel 后再运行以启用两卡模型并行。"
+        )
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES_REMAP
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import timm
+from safetensors.torch import load_file as safetensors_load_file
+from transformers import Trainer, TrainingArguments
+
+# %%
+# =============================================================================
+# 需要你按 Kaggle 实际情况替换的全局路径变量（我先假设一套）
+# =============================================================================
+KAGGLE_DATA_DIR = Path("/home/ecs-user/code/happen/kaggle-csrio")  # 里面有 csiro-biomass/test.csv + test/...
+KAGGLE_VIT_DIR = Path("/home/ecs-user/code/happen/kaggle-csrio/timm/vit_7b_patch16_dinov3.lvd1689m")  # 可选：本地 vit 权重目录（里面有 model.safetensors）
+KAGGLE_HEAD_5FOLD_DIR = Path("/home/ecs-user/code/happen/kaggle-csrio/runs/hf_trainer_A")  # A 格式目录
+
+# 输出目录（Kaggle 工作目录可写）
+OUTPUT_DIR = Path("./kaggle_out")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 你训练时的相对数据目录结构（与仓库一致）
+TEST_CSV = KAGGLE_DATA_DIR / "csiro-biomass" / "test.csv"
+IMAGE_ROOT = KAGGLE_DATA_DIR / "csiro-biomass"
+SAMPLE_SUB = KAGGLE_DATA_DIR / "csiro-biomass" / "sample_submission.csv"
+
+# 5-fold
+FOLDS = (0, 1, 2, 3, 4)
+
+# 单卡建议：batch 尽量小（ViT-7B 很吃显存）
+PER_DEVICE_BATCH_SIZE = 1
+NUM_WORKERS = 1
+
+# 设备分配（在开启 REMAP_CUDA_VISIBLE_DEVICES_FOR_TRAINER 时，下面是“逻辑设备”）
+# - 默认：head 在 cuda:0（物理GPU1），backbone 在 cuda:1（物理GPU0）
+# - 若你关闭重映射：请按真实 cuda 编号自行调整
+HEAD_DEVICE_STR = "cuda:0"
+BACKBONE_DEVICE_STR = "cuda:1"
+
+# 是否做推理 TTA（会更慢；你当前要求是“平均”，默认不开）
+USE_TTA = False
+
+# %%
+# =============================================================================
+# 目标列定义（需与训练一致）
+# =============================================================================
+TARGET_COLS = ("Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g")
+
+
+# %%
+# =============================================================================
+# 训练/推理配置（需要与 train_hf_trainer.py 的 HFConfig 对齐）
+# -----------------------------------------------------------------------------
+# 如果你训练时改过 small_grid/big_grid/pyramid_dims/token_embed_dim 等结构超参，
+# 请在这里同步修改，否则 load_state_dict 会报错（结构不匹配）。
+# =============================================================================
+class InferCFG:
+    # ViT 加载方式：
+    # - 推荐：Kaggle 开网时用 hf_hub 直接拉取预训练权重（你给的方式）
+    # - 备选：不开网/想固定版本时，用本地 checkpoint_path
+    vit_load_from_hf_hub: bool = False
+    vit_hf_hub_id: str = "hf_hub:timm/vit_7b_patch16_dinov3.lvd1689m"
+    vit_name: str = "vit_7b_patch16_dinov3.lvd1689m"  # 本地 ckpt 方式需要
+    vit_checkpoint: Path = KAGGLE_VIT_DIR / "model.safetensors"  # 本地 ckpt 方式需要
+    vit_feat_dim: int = 4096
+    token_embed_dim: int = 1024
+
+    # tile grid（与你 train_hf_trainer.py 一致）
+    small_grid: Tuple[int, int] = (2, 4)
+    big_grid: Tuple[int, int] = (1, 2)
+
+    # head 结构（与你 train_hf_trainer.py 一致）
+    dropout: float = 0.1
+    hidden_ratio: float = 0.35
+    aux_head: bool = True
+    pyramid_dims: Tuple[int, int, int] = (768, 1024, 1280)
+    mamba_depth: int = 3
+    mamba_kernel: int = 5
+    mobilevit_heads: int = 4
+    mobilevit_depth: int = 2
+    sra_heads: int = 8
+    sra_ratio: int = 2
+    cross_heads: int = 8
+    cross_layers: int = 2
+    t2t_depth: int = 2
+
+
+CFG = InferCFG()
+
+
+# %%
+# =============================================================================
+# Head 结构（为保证脚本独立运行，这里直接内置一份与 train_hf_trainer.py 对齐的实现）
+# =============================================================================
+@dataclass
+class HFConfig:
+    dropout: float = 0.1
+    hidden_ratio: float = 0.35
+    aux_head: bool = True
+
+    small_grid: Tuple[int, int] = (2, 4)
+    big_grid: Tuple[int, int] = (1, 2)
+    pyramid_dims: Tuple[int, int, int] = (768, 1024, 1280)
+    mamba_depth: int = 3
+    mamba_kernel: int = 5
+    mobilevit_heads: int = 4
+    mobilevit_depth: int = 2
+    sra_heads: int = 8
+    sra_ratio: int = 2
+    cross_heads: int = 8
+    cross_layers: int = 2
+    t2t_depth: int = 2
+
+    vit_name: str = "vit_7b_patch16_dinov3.lvd1689m"
+    vit_checkpoint: Path = Path("unused")
+    vit_feat_dim: int = 4096
+    token_embed_dim: int = 1024
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        hid = int(dim * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hid),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hid, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, dim: int, heads: int = 8, dropout: float = 0.0, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = FeedForward(dim, mlp_ratio=mlp_ratio, dropout=dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + attn_out
+        x = x + self.ff(self.norm2(x))
+        return x
+
+
+class MobileViTBlock(nn.Module):
+    def __init__(
+        self, dim: int, heads: int = 4, depth: int = 2, patch: Tuple[int, int] = (2, 2), dropout: float = 0.0
+    ):
+        super().__init__()
+        self.local = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),
+            nn.Conv2d(dim, dim, 1),
+            nn.GELU(),
+        )
+        self.patch = patch
+        self.transformer = nn.ModuleList(
+            [AttentionBlock(dim, heads=heads, dropout=dropout, mlp_ratio=2.0) for _ in range(depth)]
+        )
+        self.fuse = nn.Conv2d(dim * 2, dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        local_feat = self.local(x)
+        bsz, ch, h, w = local_feat.shape
+        ph, pw = self.patch
+        new_h = math.ceil(h / ph) * ph
+        new_w = math.ceil(w / pw) * pw
+        if new_h != h or new_w != w:
+            local_feat = F.interpolate(local_feat, size=(new_h, new_w), mode="bilinear", align_corners=False)
+            h, w = new_h, new_w
+
+        tokens = local_feat.unfold(2, ph, ph).unfold(3, pw, pw)  # B,C,nh,nw,ph,pw
+        tokens = tokens.contiguous().view(bsz, ch, -1, ph, pw)
+        tokens = tokens.permute(0, 2, 3, 4, 1).reshape(bsz, -1, ch)
+
+        for blk in self.transformer:
+            tokens = blk(tokens)
+
+        feat = tokens.view(bsz, -1, ph * pw, ch).permute(0, 3, 1, 2)
+        nh = h // ph
+        nw = w // pw
+        feat = feat.view(bsz, ch, nh, nw, ph, pw).permute(0, 1, 2, 4, 3, 5)
+        feat = feat.reshape(bsz, ch, h, w)
+
+        if feat.shape[-2:] != x.shape[-2:]:
+            feat = F.interpolate(feat, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+        out = self.fuse(torch.cat([x, feat], dim=1))
+        return out
+
+
+class SpatialReductionAttention(nn.Module):
+    def __init__(self, dim: int, heads: int = 8, sr_ratio: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+        self.q = nn.Linear(dim, dim)
+        self.kv = nn.Linear(dim, dim * 2)
+        self.sr_ratio = sr_ratio
+        if sr_ratio > 1:
+            self.sr = nn.Conv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio)
+            self.norm = nn.LayerNorm(dim)
+        else:
+            self.sr = None
+        self.proj = nn.Linear(dim, dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
+        bsz, n, ch = x.shape
+        q = self.q(x).reshape(bsz, n, self.heads, ch // self.heads).permute(0, 2, 1, 3)
+
+        if self.sr is not None:
+            h, w = hw
+            feat = x.transpose(1, 2).reshape(bsz, ch, h, w)
+            feat = self.sr(feat)
+            feat = feat.reshape(bsz, ch, -1).transpose(1, 2)
+            feat = self.norm(feat)
+        else:
+            feat = x
+
+        kv = self.kv(feat)
+        k, v = kv.chunk(2, dim=-1)
+        k = k.reshape(bsz, -1, self.heads, ch // self.heads).permute(0, 2, 3, 1)
+        v = v.reshape(bsz, -1, self.heads, ch // self.heads).permute(0, 2, 1, 3)
+
+        attn = torch.matmul(q, k) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.drop(attn)
+        out = torch.matmul(attn, v).permute(0, 2, 1, 3).reshape(bsz, n, ch)
+        out = self.proj(out)
+        return out
+
+
+class PVTBlock(nn.Module):
+    def __init__(self, dim: int, heads: int = 8, sr_ratio: int = 2, dropout: float = 0.0, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.sra = SpatialReductionAttention(dim, heads=heads, sr_ratio=sr_ratio, dropout=dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = FeedForward(dim, mlp_ratio=mlp_ratio, dropout=dropout)
+
+    def forward(self, x: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
+        x = x + self.sra(self.norm1(x), hw)
+        x = x + self.ff(self.norm2(x))
+        return x
+
+
+class LocalMambaBlock(nn.Module):
+    def __init__(self, dim: int, kernel_size: int = 5, dropout: float = 0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.dwconv = nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim)
+        self.gate = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shortcut = x
+        x = self.norm(x)
+        g = torch.sigmoid(self.gate(x))
+        x = (x * g).transpose(1, 2)
+        x = self.dwconv(x).transpose(1, 2)
+        x = self.proj(x)
+        x = self.drop(x)
+        return shortcut + x
+
+
+class T2TRetokenizer(nn.Module):
+    def __init__(self, dim: int, depth: int = 2, heads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [AttentionBlock(dim, heads=heads, dropout=dropout, mlp_ratio=2.0) for _ in range(depth)]
+        )
+
+    def forward(self, tokens: torch.Tensor, grid_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
+        bsz, _, ch = tokens.shape
+        h, w = grid_hw
+        feat_map = tokens.transpose(1, 2).reshape(bsz, ch, h, w)
+        seq = feat_map.flatten(2).transpose(1, 2)
+        for blk in self.blocks:
+            seq = blk(seq)
+        seq_map = seq.transpose(1, 2).reshape(bsz, ch, h, w)
+        pooled = F.adaptive_avg_pool2d(seq_map, (2, 2))
+        retokens = pooled.flatten(2).transpose(1, 2)
+        return retokens, seq_map
+
+
+class CrossScaleFusion(nn.Module):
+    def __init__(self, dim: int, heads: int = 6, dropout: float = 0.0, layers: int = 2):
+        super().__init__()
+        self.layers_s = nn.ModuleList(
+            [AttentionBlock(dim, heads=heads, dropout=dropout, mlp_ratio=2.0) for _ in range(layers)]
+        )
+        self.layers_b = nn.ModuleList(
+            [AttentionBlock(dim, heads=heads, dropout=dropout, mlp_ratio=2.0) for _ in range(layers)]
+        )
+        self.cross_s = nn.ModuleList(
+            [nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True, kdim=dim, vdim=dim) for _ in range(layers)]
+        )
+        self.cross_b = nn.ModuleList(
+            [nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True, kdim=dim, vdim=dim) for _ in range(layers)]
+        )
+        self.norm_s = nn.LayerNorm(dim)
+        self.norm_b = nn.LayerNorm(dim)
+
+    def forward(self, tok_s: torch.Tensor, tok_b: torch.Tensor) -> torch.Tensor:
+        bsz, _, ch = tok_s.shape
+        cls_s = tok_s.new_zeros(bsz, 1, ch)
+        cls_b = tok_b.new_zeros(bsz, 1, ch)
+        tok_s = torch.cat([cls_s, tok_s], dim=1)
+        tok_b = torch.cat([cls_b, tok_b], dim=1)
+
+        for ls, lb, cs, cb in zip(self.layers_s, self.layers_b, self.cross_s, self.cross_b):
+            tok_s = ls(tok_s)
+            tok_b = lb(tok_b)
+            q_s = self.norm_s(tok_s[:, :1])
+            q_b = self.norm_b(tok_b[:, :1])
+            cls_s_upd, _ = cs(q_s, torch.cat([tok_b, q_b], dim=1), torch.cat([tok_b, q_b], dim=1), need_weights=False)
+            cls_b_upd, _ = cb(q_b, torch.cat([tok_s, q_s], dim=1), torch.cat([tok_s, q_s], dim=1), need_weights=False)
+            tok_s = torch.cat([tok_s[:, :1] + cls_s_upd, tok_s[:, 1:]], dim=1)
+            tok_b = torch.cat([tok_b[:, :1] + cls_b_upd, tok_b[:, 1:]], dim=1)
+
+        tokens = torch.cat([tok_s[:, :1], tok_b[:, :1], tok_s[:, 1:], tok_b[:, 1:]], dim=1)
+        return tokens
+
+
+class PyramidMixer(nn.Module):
+    def __init__(
+        self,
+        dim_in: int,
+        dims: Tuple[int, int, int],
+        mobilevit_heads: int = 4,
+        mobilevit_depth: int = 2,
+        sra_heads: int = 6,
+        sra_ratio: int = 2,
+        mamba_depth: int = 3,
+        mamba_kernel: int = 5,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        c1, c2, c3 = dims
+        self.proj1 = nn.Linear(dim_in, c1)
+        self.mobilevit = MobileViTBlock(c1, heads=mobilevit_heads, depth=mobilevit_depth, dropout=dropout)
+        self.proj2 = nn.Linear(c1, c2)
+        self.pvt = PVTBlock(c2, heads=sra_heads, sr_ratio=sra_ratio, dropout=dropout, mlp_ratio=3.0)
+        self.mamba_local = LocalMambaBlock(c2, kernel_size=mamba_kernel, dropout=dropout)
+        self.proj3 = nn.Linear(c2, c3)
+        self.mamba_global = nn.ModuleList([LocalMambaBlock(c3, kernel_size=mamba_kernel, dropout=dropout) for _ in range(mamba_depth)])
+        self.final_attn = AttentionBlock(c3, heads=min(8, c3 // 64 + 1), dropout=dropout, mlp_ratio=2.0)
+
+    def _tokens_to_map(self, tokens: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
+        bsz, n, ch = tokens.shape
+        h, w = target_hw
+        need = h * w
+        if n < need:
+            pad = tokens.new_zeros(bsz, need - n, ch)
+            tokens = torch.cat([tokens, pad], dim=1)
+        tokens = tokens[:, :need, :]
+        feat_map = tokens.transpose(1, 2).reshape(bsz, ch, h, w)
+        return feat_map
+
+    @staticmethod
+    def _fit_hw(n_tokens: int) -> Tuple[int, int]:
+        h = int(math.sqrt(n_tokens))
+        w = h
+        while h * w < n_tokens:
+            w += 1
+            if h * w < n_tokens:
+                h += 1
+        return h, w
+
+    def forward(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        bsz, n, _ = tokens.shape
+        map_hw = (3, 4)
+        t1 = self.proj1(tokens)
+        m1 = self._tokens_to_map(t1, map_hw)
+        m1 = self.mobilevit(m1)
+        t1_out = m1.flatten(2).transpose(1, 2)[:, :n]
+
+        t2 = self.proj2(t1_out)
+        new_len = max(4, n // 2)
+        t2 = t2[:, :new_len] + F.adaptive_avg_pool1d(t2.transpose(1, 2), new_len).transpose(1, 2)
+        hw2 = self._fit_hw(t2.size(1))
+        if t2.size(1) < hw2[0] * hw2[1]:
+            pad = t2.new_zeros(bsz, hw2[0] * hw2[1] - t2.size(1), t2.size(2))
+            t2 = torch.cat([t2, pad], dim=1)
+        t2 = self.pvt(t2, hw2)
+        t2 = self.mamba_local(t2)
+
+        t3 = self.proj3(t2)
+        pooled = torch.stack([t3.mean(dim=1), t3.max(dim=1).values], dim=1)
+        t3 = pooled
+        for blk in self.mamba_global:
+            t3 = blk(t3)
+        t3 = self.final_attn(t3)
+        global_feat = t3.mean(dim=1)
+        return global_feat, {"stage1_map": m1, "stage2_tokens": t2, "stage3_tokens": t3}
+
+
+class CrossPVT_T2T_MambaHead(nn.Module):
+    def __init__(self, cfg: HFConfig):
+        super().__init__()
+        self.feat_dim = cfg.vit_feat_dim
+        self.token_embed = nn.Linear(cfg.vit_feat_dim, cfg.token_embed_dim)
+        self.t2t = T2TRetokenizer(cfg.token_embed_dim, depth=cfg.t2t_depth, heads=cfg.cross_heads, dropout=cfg.dropout)
+        self.cross = CrossScaleFusion(cfg.token_embed_dim, heads=cfg.cross_heads, dropout=cfg.dropout, layers=cfg.cross_layers)
+        self.pyramid = PyramidMixer(
+            dim_in=cfg.token_embed_dim,
+            dims=cfg.pyramid_dims,
+            mobilevit_heads=cfg.mobilevit_heads,
+            mobilevit_depth=cfg.mobilevit_depth,
+            sra_heads=cfg.sra_heads,
+            sra_ratio=cfg.sra_ratio,
+            mamba_depth=cfg.mamba_depth,
+            mamba_kernel=cfg.mamba_kernel,
+            dropout=cfg.dropout,
+        )
+
+        combined = cfg.pyramid_dims[-1]
+        hidden = max(32, int(combined * cfg.hidden_ratio))
+
+        def head() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(combined, hidden),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(hidden, 1),
+            )
+
+        self.head_green = head()
+        self.head_clover = head()
+        self.head_dead = head()
+        # 训练脚本里存在但未必参与 loss 的 score_head：为了 load_state_dict 完全一致，这里保留
+        self.score_head = nn.Sequential(nn.LayerNorm(combined), nn.Linear(combined, 1))
+        self.aux_head = (
+            nn.Sequential(nn.LayerNorm(cfg.pyramid_dims[1]), nn.Linear(cfg.pyramid_dims[1], len(TARGET_COLS))) if cfg.aux_head else None
+        )
+        self.softplus = nn.Softplus(beta=1.0)
+
+    def forward(
+        self,
+        tokens_small: torch.Tensor,
+        tokens_big: torch.Tensor,
+        small_grid: Tuple[int, int],
+        return_features: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        tokens_small = self.token_embed(tokens_small)
+        tokens_big = self.token_embed(tokens_big)
+
+        t2, stage1_map = self.t2t(tokens_small, small_grid)
+        fused = self.cross(t2, tokens_big)
+        feat, feat_maps = self.pyramid(fused)
+        feat_maps["stage1_map"] = stage1_map
+
+        green_pos = self.softplus(self.head_green(feat))
+        clover_pos = self.softplus(self.head_clover(feat))
+        dead_pos = self.softplus(self.head_dead(feat))
+
+        out: Dict[str, torch.Tensor] = {"green": green_pos, "dead": dead_pos, "clover": clover_pos, "score_feat": feat}
+        if self.aux_head is not None:
+            aux_tokens = feat_maps["stage2_tokens"]
+            aux_pred = self.softplus(self.aux_head(aux_tokens.mean(dim=1)))
+            out["aux"] = aux_pred
+        if return_features:
+            out["feature_maps"] = {"stage1": feat_maps.get("stage1_map"), "stage3": feat_maps.get("stage3_tokens")}
+        return out
+
+
+# %%
+# =============================================================================
+# 数据增强：推理用 train=False（只做 Normalize + ToTensor）
+# =============================================================================
+def build_full_image_transform(train: bool) -> A.Compose:
+    aug = [
+        A.OneOf(
+            [
+                A.HorizontalFlip(p=1.0),
+                A.VerticalFlip(p=1.0),
+            ],
+            p=0.8 if train else 0.0,
+        ),
+        A.RandomBrightnessContrast(0.15, 0.15, p=0.6 if train else 0.0),
+        A.HueSaturationValue(8, 12, 8, p=0.4 if train else 0.0),
+        A.RandomGamma(gamma_limit=(85, 115), p=0.25 if train else 0.0),
+        A.OneOf(
+            [
+                A.ImageCompression(quality_range=(55, 95)),
+                A.GaussNoise(std_range=(0.02, 0.10)),
+                A.GaussianBlur(blur_limit=(3, 5)),
+                A.MotionBlur(blur_limit=3),
+            ],
+            p=0.30 if train else 0.0,
+        ),
+        A.Normalize(mean=(0, 0, 0), std=(1, 1, 1), max_pixel_value=255.0),
+        ToTensorV2(),
+    ]
+    return A.Compose(aug)
+
+
+# %%
+# =============================================================================
+# Test Dataset：按“图片级别”去重，避免同一张图算 5 次 ViT
+# =============================================================================
+class BiomassHFTestImageDataset(Dataset):
+    def __init__(self, test_csv: Path, image_root: Path):
+        self.test_df = pd.read_csv(test_csv)
+        # image_id = sample_id 的前缀（__ 之前）
+        self.test_df["image_id"] = self.test_df["sample_id"].astype(str).str.split("__", n=1).str[0]
+        img_df = self.test_df.drop_duplicates("image_id")[["image_id", "image_path"]].reset_index(drop=True)
+        self.image_ids: List[str] = img_df["image_id"].tolist()
+        self.image_paths: List[str] = img_df["image_path"].tolist()
+        self.image_root = image_root
+        self.transform = build_full_image_transform(train=False)
+
+    def __len__(self) -> int:
+        return len(self.image_ids)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        rel = self.image_paths[idx]
+        img_path = self.image_root / rel
+        img = cv2.imread(str(img_path))
+        if img is None:
+            raise FileNotFoundError(f"image not found: {img_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_t = self.transform(image=img)["image"]
+        return {"pixel_values": img_t}
+
+
+def data_collator_infer(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    pixel_values = torch.stack([b["pixel_values"] for b in batch])
+    return {"pixel_values": pixel_values}
+
+
+# %%
+# =============================================================================
+# timm ViT：单独加载 + 冻结
+# =============================================================================
+def pick_infer_dtype() -> torch.dtype:
+    # Kaggle 常见 T4: bf16 不支持，优先 fp16；没有 cuda 就 fp32
+    if not torch.cuda.is_available():
+        return torch.float32
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def build_vit_backbone(
+    *,
+    vit_name: str,
+    vit_ckpt: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    # 优先：从 HuggingFace Hub 直接拉取 timm 模型（需要 Kaggle 开网）
+    if CFG.vit_load_from_hf_hub:
+        model = timm.create_model(
+            CFG.vit_hf_hub_id,
+            pretrained=True,
+            num_classes=0,
+            global_pool="avg",
+        )
+    else:
+        if not vit_ckpt.exists():
+            raise FileNotFoundError(f"ViT checkpoint 不存在: {vit_ckpt}")
+        model = timm.create_model(
+            vit_name,
+            pretrained=False,
+            num_classes=0,
+            global_pool="avg",
+            checkpoint_path=str(vit_ckpt),
+        )
+    for p in model.parameters():
+        p.requires_grad = False
+    model.eval()
+    model = model.to(device=device, dtype=dtype)
+
+    data_config = timm.data.resolve_model_data_config(model)
+    transform = timm.data.create_transform(**data_config, is_training=False)
+    return model, transform
+
+
+@torch.no_grad()
+def encode_tiles_infer(
+    images: torch.Tensor,
+    backbone: nn.Module,
+    backbone_transform,
+    grid: Tuple[int, int],
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    与 train_hf_trainer.py 的 encode_tiles 思路一致，但不强制 bfloat16，避免 Kaggle T4 等不支持。
+    """
+    bsz, ch, h, w = images.shape
+    r, c = grid
+    hs = torch.linspace(0, h, steps=r + 1, device=images.device).round().long()
+    ws = torch.linspace(0, w, steps=c + 1, device=images.device).round().long()
+
+    tiles: List[torch.Tensor] = []
+    for i in range(r):
+        for j in range(c):
+            rs, re = hs[i].item(), hs[i + 1].item()
+            cs, ce = ws[j].item(), ws[j + 1].item()
+            tiles.append(images[:, :, rs:re, cs:ce])
+    tiles = torch.stack(tiles, dim=1)  # [B, T, C, Ht, Wt]
+    flat = tiles.view(-1, ch, tiles.shape[-2], tiles.shape[-1])
+
+    # timm transform 逐 tile 处理（与训练保持一致）
+    proc = []
+    for t in flat:
+        proc.append(backbone_transform(t.to(torch.float16)).unsqueeze(0))
+    proc = torch.cat(proc, dim=0).to(images.device).to(dtype)
+
+    feats = backbone(proc)  # [B*T, feat]
+    feats = feats.view(bsz, -1, feats.shape[-1])  # [B, T, feat]
+    return feats
+
+
+# %%
+# =============================================================================
+# 5-fold ensemble 模型（一次 ViT 编码，多 head 平均）
+# =============================================================================
+class HFEnsembleWrapper(nn.Module):
+    def __init__(
+        self,
+        *,
+        cfg: InferCFG,
+        backbone: nn.Module,
+        backbone_transform,
+        dtype: torch.dtype,
+        backbone_device: torch.device,
+        head_device: torch.device,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.dtype = dtype
+        self.backbone_device = backbone_device
+        self.head_device = head_device
+
+        # 关键：不要把 backbone 注册为 nn.Module 子模块（否则 Trainer 会把它一起 .to(head_device)，破坏模型并行）
+        # 这里用 __dict__ 绕开 nn.Module.__setattr__ 的注册逻辑。
+        self.__dict__["backbone"] = backbone
+        self.__dict__["backbone_transform"] = backbone_transform
+
+        # 用 HFConfig 创建 head（保持 train_hf_trainer.py 一致）
+        head_cfg = HFConfig(
+            dropout=cfg.dropout,
+            hidden_ratio=cfg.hidden_ratio,
+            aux_head=cfg.aux_head,
+            small_grid=cfg.small_grid,
+            big_grid=cfg.big_grid,
+            pyramid_dims=cfg.pyramid_dims,
+            mamba_depth=cfg.mamba_depth,
+            mamba_kernel=cfg.mamba_kernel,
+            mobilevit_heads=cfg.mobilevit_heads,
+            mobilevit_depth=cfg.mobilevit_depth,
+            sra_heads=cfg.sra_heads,
+            sra_ratio=cfg.sra_ratio,
+            cross_heads=cfg.cross_heads,
+            cross_layers=cfg.cross_layers,
+            t2t_depth=cfg.t2t_depth,
+            vit_name=cfg.vit_name,
+            vit_checkpoint=Path("unused_in_infer"),
+            vit_feat_dim=cfg.vit_feat_dim,
+            token_embed_dim=cfg.token_embed_dim,
+        )
+
+        self.heads = nn.ModuleList([CrossPVT_T2T_MambaHead(head_cfg) for _ in range(len(FOLDS))])
+
+    def load_fold_head_from_safetensors(self, fold_idx: int, safetensors_path: Path) -> None:
+        sd = safetensors_load_file(str(safetensors_path))
+        # 训练时保存的是 HFWrapper 的 state_dict（不含 backbone），head 权重在 "head.*"
+        head_sd = {k[len("head.") :]: v for k, v in sd.items() if k.startswith("head.")}
+        missing, unexpected = self.heads[fold_idx].load_state_dict(head_sd, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"fold{fold_idx} head load_state_dict 不匹配：missing={missing[:10]} unexpected={unexpected[:10]}"
+            )
+
+    def forward(self, pixel_values=None, labels=None):
+        # Trainer.predict 会传 pixel_values；labels 为 None
+        # pixel_values 默认会被 Trainer 放到“模型设备”（也就是 head_device），这里我们手动搬到 backbone_device 做 ViT 编码
+        if pixel_values.device != self.backbone_device:
+            pixel_values_bb = pixel_values.to(device=self.backbone_device, non_blocking=True)
+        else:
+            pixel_values_bb = pixel_values
+
+        tok_small = encode_tiles_infer(
+            pixel_values_bb, self.backbone, self.backbone_transform, self.cfg.small_grid, dtype=self.dtype
+        )
+        tok_big = encode_tiles_infer(
+            pixel_values_bb, self.backbone, self.backbone_transform, self.cfg.big_grid, dtype=self.dtype
+        )
+
+        # 把 token 搬到 head_device 给 head 推理
+        if tok_small.device != self.head_device:
+            tok_small = tok_small.to(device=self.head_device, non_blocking=True)
+        if tok_big.device != self.head_device:
+            tok_big = tok_big.to(device=self.head_device, non_blocking=True)
+
+        logits_list = []
+        for head in self.heads:
+            out = head(tok_small, tok_big, self.cfg.small_grid, return_features=False)
+            green = out["green"]
+            clover = out["clover"]
+            dead = out["dead"]
+            gdm = green + clover
+            total = green + clover + dead
+            logits = torch.cat([green, dead, clover, gdm, total], dim=1)  # [B, 5]
+            logits_list.append(logits)
+
+        logits_mean = torch.stack(logits_list, dim=0).mean(dim=0)
+        return {"logits": logits_mean}
+
+
+# %%
+# =============================================================================
+# 单 fold 模型（常驻 1 个 head；每个 fold 推理完后释放，再加载下一个 fold）
+# =============================================================================
+class HFSingleFoldWrapper(nn.Module):
+    def __init__(
+        self,
+        *,
+        cfg: InferCFG,
+        backbone: nn.Module,
+        backbone_transform,
+        dtype: torch.dtype,
+        backbone_device: torch.device,
+        head_device: torch.device,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.dtype = dtype
+        self.backbone_device = backbone_device
+        self.head_device = head_device
+
+        # 关键：告诉 HuggingFace Trainer 这是“模型并行”，避免：
+        # - 自动 nn.DataParallel（多 GPU 时默认会包一层，破坏我们的 device 搬运逻辑）
+        # - 自动把整个 model 迁移到 args.device（通常是 cuda:0）
+        #
+        # 参考：HF 内置的 model-parallel 模型也用这些标记来让 Trainer 跳过 DP 包装。
+        self.is_parallelizable = True
+        self.model_parallel = True
+        self.device_map = {"backbone": str(backbone_device), "head": str(head_device)}
+
+        # 关键：不要把 backbone 注册为 nn.Module 子模块（否则 Trainer 会把它一起 .to(head_device)，破坏模型并行）
+        self.__dict__["backbone"] = backbone
+        self.__dict__["backbone_transform"] = backbone_transform
+
+        head_cfg = HFConfig(
+            dropout=cfg.dropout,
+            hidden_ratio=cfg.hidden_ratio,
+            aux_head=cfg.aux_head,
+            small_grid=cfg.small_grid,
+            big_grid=cfg.big_grid,
+            pyramid_dims=cfg.pyramid_dims,
+            mamba_depth=cfg.mamba_depth,
+            mamba_kernel=cfg.mamba_kernel,
+            mobilevit_heads=cfg.mobilevit_heads,
+            mobilevit_depth=cfg.mobilevit_depth,
+            sra_heads=cfg.sra_heads,
+            sra_ratio=cfg.sra_ratio,
+            cross_heads=cfg.cross_heads,
+            cross_layers=cfg.cross_layers,
+            t2t_depth=cfg.t2t_depth,
+            vit_name=cfg.vit_name,
+            vit_checkpoint=Path("unused_in_infer"),
+            vit_feat_dim=cfg.vit_feat_dim,
+            token_embed_dim=cfg.token_embed_dim,
+        )
+        self.head = CrossPVT_T2T_MambaHead(head_cfg)
+
+    def load_head_from_safetensors(self, safetensors_path: Path) -> None:
+        sd = safetensors_load_file(str(safetensors_path))
+        head_sd = {k[len("head.") :]: v for k, v in sd.items() if k.startswith("head.")}
+        missing, unexpected = self.head.load_state_dict(head_sd, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(f"head load_state_dict 不匹配：missing={missing[:10]} unexpected={unexpected[:10]}")
+
+    def forward(self, pixel_values=None, labels=None):
+        if pixel_values.device != self.backbone_device:
+            pixel_values_bb = pixel_values.to(device=self.backbone_device, non_blocking=True)
+        else:
+            pixel_values_bb = pixel_values
+
+        tok_small = encode_tiles_infer(
+            pixel_values_bb, self.backbone, self.backbone_transform, self.cfg.small_grid, dtype=self.dtype
+        )
+        tok_big = encode_tiles_infer(
+            pixel_values_bb, self.backbone, self.backbone_transform, self.cfg.big_grid, dtype=self.dtype
+        )
+
+        if tok_small.device != self.head_device:
+            tok_small = tok_small.to(device=self.head_device, non_blocking=True)
+        if tok_big.device != self.head_device:
+            tok_big = tok_big.to(device=self.head_device, non_blocking=True)
+
+        out = self.head(tok_small, tok_big, self.cfg.small_grid, return_features=False)
+        green = out["green"]
+        clover = out["clover"]
+        dead = out["dead"]
+        gdm = green + clover
+        total = green + clover + dead
+        logits = torch.cat([green, dead, clover, gdm, total], dim=1)  # [B, 5]
+        return {"logits": logits}
+
+
+
+
+# %%
+# =============================================================================
+# 推理 + 生成 submission.csv（Trainer.predict）
+# =============================================================================
+def make_submission_from_image_preds(
+    *,
+    test_csv: Path,
+    image_ids: List[str],
+    image_pred_5: np.ndarray,
+    out_csv: Path,
+) -> Path:
+    test_df = pd.read_csv(test_csv)
+    test_df["image_id"] = test_df["sample_id"].astype(str).str.split("__", n=1).str[0]
+
+    pred_df = pd.DataFrame(image_pred_5, columns=list(TARGET_COLS))
+    pred_df["image_id"] = image_ids
+
+    merged = test_df.merge(pred_df, on="image_id", how="left")
+    if merged[list(TARGET_COLS)].isna().any().any():
+        raise RuntimeError("merge 后存在缺失预测：请检查 image_id 对齐是否一致")
+
+    # 每行根据 target_name 选择对应列
+    def pick_row(r):
+        return float(r[r["target_name"]])
+
+    merged["target"] = merged.apply(pick_row, axis=1)
+    sub = merged[["sample_id", "target"]].copy()
+    out_csv = Path(out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    sub.to_csv(out_csv, index=False)
+    return out_csv
+
+
+def run_predict_5fold() -> Path:
+    # 设备选择：默认 head 在 cuda:0；若启用模型并行且 >=2 GPU，则 backbone=cuda:0, head=cuda:1
+    if torch.cuda.is_available():
+        n_gpu = torch.cuda.device_count()
+    else:
+        n_gpu = 0
+
+    if USE_MODEL_PARALLEL and n_gpu >= 2:
+        backbone_device = torch.device(BACKBONE_DEVICE_STR)
+        head_device = torch.device(HEAD_DEVICE_STR)
+    else:
+        # 回退：单卡/CPU
+        head_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        backbone_device = head_device
+
+    dtype = pick_infer_dtype()
+
+    # 1) ViT backbone（单独目录加载）
+    backbone, backbone_transform = build_vit_backbone(
+        vit_name=CFG.vit_name,
+        vit_ckpt=CFG.vit_checkpoint,
+        device=backbone_device,
+        dtype=dtype,
+    )
+
+    # 2) dataset（图片级去重）
+    ds = BiomassHFTestImageDataset(TEST_CSV, IMAGE_ROOT)
+
+    # 3) TrainingArguments（每折复用；Trainer/model 每折重建以便显存释放）
+    args = TrainingArguments(
+        output_dir=str(OUTPUT_DIR / "tmp_trainer"),
+        per_device_eval_batch_size=PER_DEVICE_BATCH_SIZE,
+        dataloader_num_workers=NUM_WORKERS,
+        report_to="none",
+        remove_unused_columns=False,
+        bf16=(dtype == torch.bfloat16),
+        fp16=(dtype == torch.float16),
+        # 只用单进程单卡（Trainer 内部的 device 仍然是 head_device；backbone 在 forward 里手动搬运）
+    )
+
+    # 4) 逐 fold 推理（常驻 1 个 head；推理后释放）
+    pred_sum: np.ndarray | None = None
+    for fold in FOLDS:
+        w = KAGGLE_HEAD_5FOLD_DIR / f"fold{fold}" / "model.safetensors"
+        if not w.exists():
+            raise FileNotFoundError(f"找不到 fold{fold} 权重: {w}")
+
+        model = HFSingleFoldWrapper(
+            cfg=CFG,
+            backbone=backbone,
+            backbone_transform=backbone_transform,
+            dtype=dtype,
+            backbone_device=backbone_device,
+            head_device=head_device,
+        ).to(device=head_device, dtype=dtype)
+        model.load_head_from_safetensors(w)
+
+        trainer = Trainer(
+            model=model,
+            args=args,
+            data_collator=data_collator_infer,
+        )
+
+        pred = trainer.predict(ds)
+        image_pred_5 = pred.predictions
+        if isinstance(image_pred_5, (tuple, list)):
+            image_pred_5 = image_pred_5[0]
+        image_pred_5 = np.asarray(image_pred_5, dtype=np.float32)
+        assert image_pred_5.shape[1] == 5, f"预测维度不对: {image_pred_5.shape}"
+
+        if pred_sum is None:
+            pred_sum = image_pred_5
+        else:
+            pred_sum = pred_sum + image_pred_5
+
+        # 释放当前 fold 的 head 显存
+        del trainer
+        del model
+        if head_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    assert pred_sum is not None
+    image_pred_5 = pred_sum / float(len(FOLDS))
+
+    out_csv = OUTPUT_DIR / "submission.csv"
+    make_submission_from_image_preds(
+        test_csv=TEST_CSV,
+        image_ids=ds.image_ids,
+        image_pred_5=image_pred_5,
+        out_csv=out_csv,
+    )
+    return out_csv
+
+
+# %%
+if __name__ == "__main__":
+    # Kaggle 只需要跑这句就能生成 submission.csv
+    out = run_predict_5fold()
+    print(f"[OK] saved: {out}")
+
+
