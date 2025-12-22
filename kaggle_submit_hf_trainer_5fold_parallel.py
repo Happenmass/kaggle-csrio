@@ -12,10 +12,11 @@ Kaggle 提交示例（Trainer + Dataset，5-fold head ensemble，timm ViT 单独
 说明：
 - 这些 head safetensors 来自你训练脚本 train_hf_trainer.py（HF Trainer 保存的 model.safetensors）
 - 权重不包含 timm ViT，所以推理时会单独加载 ViT，并把 ViT 特征喂给 head
-- 本脚本为 **FAST 双卡缓存推理**：两阶段（ViT 预计算缓存 -> head 推理），最后写出 submission.csv
+- 推理使用 Trainer.predict(...)，并对 5 折输出做 simple mean
 """
 
 # %%
+import os
 import sys
 import math
 from dataclasses import dataclass
@@ -24,8 +25,6 @@ from typing import Dict, List, Tuple
 
 import json
 import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import gc
 
 import cv2
 import numpy as np
@@ -33,9 +32,13 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 import timm
 from safetensors.torch import load_file as safetensors_load_file
+from transformers import Trainer, TrainingArguments
 
 # %%
 # =============================================================================
@@ -58,160 +61,27 @@ SAMPLE_SUB = KAGGLE_DATA_DIR / "csiro-biomass" / "sample_submission.csv"
 FOLDS = (0, 1, 2, 3, 4)
 
 # 单卡建议：batch 尽量小（ViT-7B 很吃显存）
+PER_DEVICE_BATCH_SIZE = 1
+NUM_WORKERS = 1
+
 # =============================================================================
-# Fast 推理（两阶段：ViT 预计算缓存 -> head 推理），双进程/双卡并行
+# Fast 推理（不使用 Trainer）：两阶段（ViT 预计算缓存 -> head 推理），双进程/双卡并行
 # =============================================================================
+FAST_INFER = True
 GPU_IDS = (0, 1)  # 物理 GPU id（Kaggle 双卡常见是 0/1）
 VIT_BATCH_SIZE = 2  # ViT 预计算阶段 batch（太大容易 OOM）
 HEAD_BATCH_SIZE = 32  # head 推理阶段 batch（通常可以大很多）
 CACHE_DIR = OUTPUT_DIR / "vit_cache"
-# ViT 预处理模式：
-# - "exact_timm": 恢复原来的 backbone_transform 路径（timm.create_transform），最接近原版结果，但更慢
-# - "fast_gpu": 纯 torch GPU resize+normalize（更快，但会产生可见差异）
-VIT_PREPROCESS_MODE = "exact_timm"  # "exact_timm" or "fast_gpu"
-# 缓存精度：
-# - "fp16": 更快/更省磁盘，但会引入量化误差（submission 可能与非缓存版略有差异）
-# - "fp32": 更接近“直接推理不落盘”的结果，但更占磁盘/IO
-CACHE_DTYPE = "fp32"  # "fp16" or "fp32"
 
-# Head 推理精度策略（为了更贴近 Trainer 的 AMP 行为）
-# - head 权重保持 fp32，forward 用 autocast（很多算子会自动选择更稳定的内部精度）
-HEAD_WEIGHT_DTYPE = "bf16"  # "fp32"（推荐）或 "fp16"/"bf16"
-USE_AUTOCAST_FOR_HEAD = False
+# -----------------------------------------------------------------------------
+# 兼容旧的 Trainer 推理路径（如你需要回退）
+# -----------------------------------------------------------------------------
+USE_MODEL_PARALLEL = True
+BACKBONE_DEVICE_STR = "cuda:0"
+HEAD_DEVICE_STR = "cuda:1"
 
-# ViT 推理时是否也启用 autocast（进一步贴近 Trainer/AMP 行为）
-USE_AUTOCAST_FOR_VIT = False
-
-# Notebook 里 multiprocessing(spawn) 经常会因为函数无法从 __main__ 导入而报：
-# "Can't get attribute '_vit_precompute_worker' on <module '__main__' ...>"
-# 为了在 notebook 里也能双卡并行，这里提供线程后端（同一进程两个线程分别绑定两张 GPU）。
-# - "process": 用多进程（更隔离，Kaggle Script 场景推荐）
-# - "thread": 用多线程（Notebook 场景推荐，避免 spawn pickle/import 问题）
-PARALLEL_BACKEND = "thread"  # "thread" or "process"
-VIT_INIT_CPU_ONCE_CLONE_TO_GPU = True  # 仅 thread 后端生效：CPU 只加载 1 次 ViT，然后复制到两张 GPU
-
-
-def _in_notebook() -> bool:
-    return "ipykernel" in sys.modules or "IPython" in sys.modules
-
-
-def _run_parallel_jobs(jobs: list[tuple[callable, dict]], *, backend: str) -> None:
-    """
-    jobs: [(fn, kwargs), ...]
-    backend:
-      - "process": spawn 子进程执行（要求 fn 可 picklable 且在可 import 的模块顶层定义）
-      - "thread": 线程执行（Notebook 友好；同进程共享内存，需注意不要写同一段 memmap）
-    """
-    if backend == "process":
-        ctx = mp.get_context("spawn")
-        procs = []
-        for fn, kwargs in jobs:
-            p = ctx.Process(target=fn, kwargs=kwargs)
-            p.start()
-            procs.append(p)
-        for p in procs:
-            p.join()
-            if p.exitcode != 0:
-                raise RuntimeError(f"子进程异常退出：exitcode={p.exitcode}")
-        return
-
-    # thread backend
-    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
-        futs = [ex.submit(fn, **kwargs) for fn, kwargs in jobs]
-        for fut in as_completed(futs):
-            # re-raise any exception
-            fut.result()
-
-
-# thread 后端下的共享 ViT（每张 GPU 一份），避免每个线程各自从磁盘/Hub 加载
-_VIT_THREAD_MODELS: dict[int, tuple[nn.Module, object]] = {}
-
-
-def _create_vit_model_uninitialized_on_device(device: torch.device) -> nn.Module:
-    """
-    在指定 device 上创建与 ViT-7B 同结构的模型，但不从磁盘/Hub 加载权重（pretrained=False）。
-    通过 torch.set_default_device 尽量避免在 CPU 上分配巨型参数（对 7B 很关键）。
-    """
-    # torch.set_default_device 是全局的，尽量短时间使用
-    torch.set_default_device(str(device))
-    try:
-        if CFG.vit_load_from_hf_hub:
-            m = timm.create_model(
-                CFG.vit_hf_hub_id,
-                pretrained=False,
-                num_classes=0,
-                global_pool="avg",
-            )
-        else:
-            m = timm.create_model(
-                CFG.vit_name,
-                pretrained=False,
-                num_classes=0,
-                global_pool="avg",
-            )
-    finally:
-        torch.set_default_device("cpu")
-    return m
-
-
-def _init_vit_models_for_thread_backend(gpu_ids: Tuple[int, int], dtype: torch.dtype) -> None:
-    """
-    thread 后端下的 ViT 常驻缓存：为每张 GPU 各创建一份 ViT（每个 GPU 一份），供 thread 后端并行使用。
-    """
-    global _VIT_THREAD_MODELS
-    if _VIT_THREAD_MODELS:
-        return
-
-    # 2) 逐 GPU 创建模型并加载权重（CPU -> GPU copy）
-    for dev_id in gpu_ids:
-        torch.cuda.set_device(dev_id)
-        dev = torch.device(f"cuda:{dev_id}")
-        m = timm.create_model(
-            CFG.vit_name,
-            pretrained=False,
-            num_classes=0,
-            global_pool="avg",
-            checkpoint_path=str(CFG.vit_checkpoint),
-        )
-
-        m.eval()
-        m.to(device=dev, dtype=dtype)
-        data_config = timm.data.resolve_model_data_config(m)
-        backbone_transform = timm.data.create_transform(**data_config, is_training=False)
-        _VIT_THREAD_MODELS[dev_id] = (m, backbone_transform)
-        
-    gc.collect()
-
-
-def _clear_vit_models_for_thread_backend(*, gpu_ids: Tuple[int, int]) -> None:
-    """
-    释放 thread 后端缓存的 ViT（以及其占用的 GPU 显存）。
-    注意：只应在 ViT 预计算阶段完全结束后调用；head 推理阶段不需要 ViT。
-    """
-    global _VIT_THREAD_MODELS
-    if not _VIT_THREAD_MODELS:
-        return
-
-    # 先断开 Python 引用（释放模型对象）
-    for dev_id in list(_VIT_THREAD_MODELS.keys()):
-        m, _ = _VIT_THREAD_MODELS[dev_id]
-        del m
-        del _VIT_THREAD_MODELS[dev_id]
-
-    _VIT_THREAD_MODELS.clear()
-    gc.collect()
-
-    # 再尝试回收各 GPU 的缓存显存
-    if torch.cuda.is_available():
-        for dev_id in gpu_ids:
-            try:
-                torch.cuda.set_device(dev_id)
-                torch.cuda.empty_cache()
-            except Exception:
-                # 清理逻辑尽量不影响主流程
-                pass
-
-
+# 是否做推理 TTA（会更慢；你当前要求是“平均”，默认不开）
+USE_TTA = False
 
 # %%
 # =============================================================================
@@ -646,6 +516,70 @@ class CrossPVT_T2T_MambaHead(nn.Module):
 
 
 # %%
+# =============================================================================
+# 数据增强：推理用 train=False（只做 Normalize + ToTensor）
+# =============================================================================
+def build_full_image_transform(train: bool) -> A.Compose:
+    aug = [
+        A.OneOf(
+            [
+                A.HorizontalFlip(p=1.0),
+                A.VerticalFlip(p=1.0),
+            ],
+            p=0.8 if train else 0.0,
+        ),
+        A.RandomBrightnessContrast(0.15, 0.15, p=0.6 if train else 0.0),
+        A.HueSaturationValue(8, 12, 8, p=0.4 if train else 0.0),
+        A.RandomGamma(gamma_limit=(85, 115), p=0.25 if train else 0.0),
+        A.OneOf(
+            [
+                A.ImageCompression(quality_range=(55, 95)),
+                A.GaussNoise(std_range=(0.02, 0.10)),
+                A.GaussianBlur(blur_limit=(3, 5)),
+                A.MotionBlur(blur_limit=3),
+            ],
+            p=0.30 if train else 0.0,
+        ),
+        A.Normalize(mean=(0, 0, 0), std=(1, 1, 1), max_pixel_value=255.0),
+        ToTensorV2(),
+    ]
+    return A.Compose(aug)
+
+
+# %%
+# =============================================================================
+# Test Dataset：按“图片级别”去重，避免同一张图算 5 次 ViT
+# =============================================================================
+class BiomassHFTestImageDataset(Dataset):
+    def __init__(self, test_csv: Path, image_root: Path):
+        self.test_df = pd.read_csv(test_csv)
+        # image_id = sample_id 的前缀（__ 之前）
+        self.test_df["image_id"] = self.test_df["sample_id"].astype(str).str.split("__", n=1).str[0]
+        img_df = self.test_df.drop_duplicates("image_id")[["image_id", "image_path"]].reset_index(drop=True)
+        self.image_ids: List[str] = img_df["image_id"].tolist()
+        self.image_paths: List[str] = img_df["image_path"].tolist()
+        self.image_root = image_root
+        self.transform = build_full_image_transform(train=False)
+
+    def __len__(self) -> int:
+        return len(self.image_ids)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        rel = self.image_paths[idx]
+        img_path = self.image_root / rel
+        img = cv2.imread(str(img_path))
+        if img is None:
+            raise FileNotFoundError(f"image not found: {img_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_t = self.transform(image=img)["image"]
+        return {"pixel_values": img_t}
+
+
+def data_collator_infer(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    pixel_values = torch.stack([b["pixel_values"] for b in batch])
+    return {"pixel_values": pixel_values}
+
+
 # %%
 # =============================================================================
 # timm ViT：单独加载 + 冻结
@@ -706,8 +640,7 @@ def _resize_norm_batch(x: torch.Tensor, *, out_hw: Tuple[int, int], dtype: torch
     x: [B,3,H,W]，值域假设在 [0,1]
     输出：resize 到 out_hw + timm mean/std normalize
     """
-    # timm/torchvision 的 Resize 通常会做 antialias；这里打开 antialias 以尽量贴近 timm 行为
-    x = F.interpolate(x, size=out_hw, mode="bicubic", align_corners=False, antialias=True)
+    x = F.interpolate(x, size=out_hw, mode="bicubic", align_corners=False)
     mean, std = _vit_mean_std()
     mean = mean.to(device=x.device, dtype=x.dtype)
     std = std.to(device=x.device, dtype=x.dtype)
@@ -743,70 +676,211 @@ def encode_tiles_fast(
     tiles = torch.stack(tiles, dim=1)  # [B,T,C,Ht,Wt]
     flat = tiles.reshape(-1, ch, tiles.shape[-2], tiles.shape[-1])  # [B*T,C,Ht,Wt]
     flat = _resize_norm_batch(flat, out_hw=vit_input_hw, dtype=dtype)
-    if USE_AUTOCAST_FOR_VIT and flat.is_cuda:
-        with torch.autocast(device_type="cuda", dtype=dtype):
-            feats = backbone(flat)  # [B*T, feat]
-    else:
-        feats = backbone(flat)  # [B*T, feat]
+    feats = backbone(flat)  # [B*T, feat]
     feats = feats.view(bsz, -1, feats.shape[-1])  # [B, T, feat]
     return feats
 
 
-@torch.no_grad()
-def encode_tiles_exact_timm_transform(
-    images: torch.Tensor,
-    backbone: nn.Module,
-    backbone_transform,
-    grid: Tuple[int, int],
-    *,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """
-    恢复原版路径：逐 tile 调用 timm.create_transform（backbone_transform），以最大程度复现原先输出。
-    注意：该路径会比 fast_gpu 慢（存在 python for 循环）。
-    """
-    bsz, ch, h, w = images.shape
-    r, c = grid
-    hs = torch.linspace(0, h, steps=r + 1).round().long()
-    ws = torch.linspace(0, w, steps=c + 1).round().long()
-
-    tiles: List[torch.Tensor] = []
-    for i in range(r):
-        for j in range(c):
-            rs, re = hs[i].item(), hs[i + 1].item()
-            cs, ce = ws[j].item(), ws[j + 1].item()
-            tiles.append(images[:, :, rs:re, cs:ce])
-    tiles = torch.stack(tiles, dim=1)  # [B,T,C,Ht,Wt]
-    flat = tiles.view(-1, ch, tiles.shape[-2], tiles.shape[-1])  # [B*T,C,Ht,Wt]
-
-    # 与原始 train_hf_trainer.py 的做法一致：逐 tile 走 backbone_transform（通常在 CPU）
-    proc_list = []
-    for t in flat:
-        proc_list.append(backbone_transform(t.to(torch.float16)).unsqueeze(0))
-    proc = torch.cat(proc_list, dim=0).to(device=next(backbone.parameters()).device).to(dtype)
-
-    if USE_AUTOCAST_FOR_VIT and proc.is_cuda:
-        with torch.autocast(device_type="cuda", dtype=dtype):
-            feats = backbone(proc)  # [B*T, feat]
-    else:
-        feats = backbone(proc)  # [B*T, feat]
-    feats = feats.view(bsz, -1, feats.shape[-1])
-    return feats
-
-
-# 兼容旧实现签名：根据 VIT_PREPROCESS_MODE 选择 exact_timm 或 fast_gpu
+# 兼容旧实现签名：忽略 backbone_transform，内部走更快的 encode_tiles_fast
 @torch.no_grad()
 def encode_tiles_infer(
     images: torch.Tensor,
     backbone: nn.Module,
-    backbone_transform,
+    backbone_transform,  # noqa: ARG001
     grid: Tuple[int, int],
     *,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    if VIT_PREPROCESS_MODE == "exact_timm":
-        return encode_tiles_exact_timm_transform(images, backbone, backbone_transform, grid, dtype=dtype)
     return encode_tiles_fast(images, backbone, grid, dtype=dtype)
+
+
+# %%
+# =============================================================================
+# 5-fold ensemble 模型（一次 ViT 编码，多 head 平均）
+# =============================================================================
+class HFEnsembleWrapper(nn.Module):
+    def __init__(
+        self,
+        *,
+        cfg: InferCFG,
+        backbone: nn.Module,
+        backbone_transform,
+        dtype: torch.dtype,
+        backbone_device: torch.device,
+        head_device: torch.device,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.dtype = dtype
+        self.backbone_device = backbone_device
+        self.head_device = head_device
+
+        # 关键：不要把 backbone 注册为 nn.Module 子模块（否则 Trainer 会把它一起 .to(head_device)，破坏模型并行）
+        # 这里用 __dict__ 绕开 nn.Module.__setattr__ 的注册逻辑。
+        self.__dict__["backbone"] = backbone
+        self.__dict__["backbone_transform"] = backbone_transform
+
+        # 用 HFConfig 创建 head（保持 train_hf_trainer.py 一致）
+        head_cfg = HFConfig(
+            dropout=cfg.dropout,
+            hidden_ratio=cfg.hidden_ratio,
+            aux_head=cfg.aux_head,
+            small_grid=cfg.small_grid,
+            big_grid=cfg.big_grid,
+            pyramid_dims=cfg.pyramid_dims,
+            mamba_depth=cfg.mamba_depth,
+            mamba_kernel=cfg.mamba_kernel,
+            mobilevit_heads=cfg.mobilevit_heads,
+            mobilevit_depth=cfg.mobilevit_depth,
+            sra_heads=cfg.sra_heads,
+            sra_ratio=cfg.sra_ratio,
+            cross_heads=cfg.cross_heads,
+            cross_layers=cfg.cross_layers,
+            t2t_depth=cfg.t2t_depth,
+            vit_name=cfg.vit_name,
+            vit_checkpoint=Path("unused_in_infer"),
+            vit_feat_dim=cfg.vit_feat_dim,
+            token_embed_dim=cfg.token_embed_dim,
+        )
+
+        self.heads = nn.ModuleList([CrossPVT_T2T_MambaHead(head_cfg) for _ in range(len(FOLDS))])
+
+    def load_fold_head_from_safetensors(self, fold_idx: int, safetensors_path: Path) -> None:
+        sd = safetensors_load_file(str(safetensors_path))
+        # 训练时保存的是 HFWrapper 的 state_dict（不含 backbone），head 权重在 "head.*"
+        head_sd = {k[len("head.") :]: v for k, v in sd.items() if k.startswith("head.")}
+        missing, unexpected = self.heads[fold_idx].load_state_dict(head_sd, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"fold{fold_idx} head load_state_dict 不匹配：missing={missing[:10]} unexpected={unexpected[:10]}"
+            )
+
+    def forward(self, pixel_values=None, labels=None):
+        # Trainer.predict 会传 pixel_values；labels 为 None
+        # pixel_values 默认会被 Trainer 放到“模型设备”（也就是 head_device），这里我们手动搬到 backbone_device 做 ViT 编码
+        if pixel_values.device != self.backbone_device:
+            pixel_values_bb = pixel_values.to(device=self.backbone_device, non_blocking=True)
+        else:
+            pixel_values_bb = pixel_values
+
+        tok_small = encode_tiles_infer(
+            pixel_values_bb, self.backbone, self.backbone_transform, self.cfg.small_grid, dtype=self.dtype
+        )
+        tok_big = encode_tiles_infer(
+            pixel_values_bb, self.backbone, self.backbone_transform, self.cfg.big_grid, dtype=self.dtype
+        )
+
+        # 把 token 搬到 head_device 给 head 推理
+        if tok_small.device != self.head_device:
+            tok_small = tok_small.to(device=self.head_device, non_blocking=True)
+        if tok_big.device != self.head_device:
+            tok_big = tok_big.to(device=self.head_device, non_blocking=True)
+
+        logits_list = []
+        for head in self.heads:
+            out = head(tok_small, tok_big, self.cfg.small_grid, return_features=False)
+            green = out["green"]
+            clover = out["clover"]
+            dead = out["dead"]
+            gdm = green + clover
+            total = green + clover + dead
+            logits = torch.cat([green, dead, clover, gdm, total], dim=1)  # [B, 5]
+            logits_list.append(logits)
+
+        logits_mean = torch.stack(logits_list, dim=0).mean(dim=0)
+        return {"logits": logits_mean}
+
+
+# %%
+# =============================================================================
+# 单 fold 模型（常驻 1 个 head；每个 fold 推理完后释放，再加载下一个 fold）
+# =============================================================================
+class HFSingleFoldWrapper(nn.Module):
+    def __init__(
+        self,
+        *,
+        cfg: InferCFG,
+        backbone: nn.Module,
+        backbone_transform,
+        dtype: torch.dtype,
+        backbone_device: torch.device,
+        head_device: torch.device,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.dtype = dtype
+        self.backbone_device = backbone_device
+        self.head_device = head_device
+
+        # 关键：告诉 HuggingFace Trainer 这是“模型并行”，避免：
+        # - 自动 nn.DataParallel（多 GPU 时默认会包一层，破坏我们的 device 搬运逻辑）
+        # - 自动把整个 model 迁移到 args.device（通常是 cuda:0）
+        #
+        # 参考：HF 内置的 model-parallel 模型也用这些标记来让 Trainer 跳过 DP 包装。
+        self.is_parallelizable = True
+        self.model_parallel = True
+        self.device_map = {"backbone": str(backbone_device), "head": str(head_device)}
+
+        # 关键：不要把 backbone 注册为 nn.Module 子模块（否则 Trainer 会把它一起 .to(head_device)，破坏模型并行）
+        self.__dict__["backbone"] = backbone
+        self.__dict__["backbone_transform"] = backbone_transform
+
+        head_cfg = HFConfig(
+            dropout=cfg.dropout,
+            hidden_ratio=cfg.hidden_ratio,
+            aux_head=cfg.aux_head,
+            small_grid=cfg.small_grid,
+            big_grid=cfg.big_grid,
+            pyramid_dims=cfg.pyramid_dims,
+            mamba_depth=cfg.mamba_depth,
+            mamba_kernel=cfg.mamba_kernel,
+            mobilevit_heads=cfg.mobilevit_heads,
+            mobilevit_depth=cfg.mobilevit_depth,
+            sra_heads=cfg.sra_heads,
+            sra_ratio=cfg.sra_ratio,
+            cross_heads=cfg.cross_heads,
+            cross_layers=cfg.cross_layers,
+            t2t_depth=cfg.t2t_depth,
+            vit_name=cfg.vit_name,
+            vit_checkpoint=Path("unused_in_infer"),
+            vit_feat_dim=cfg.vit_feat_dim,
+            token_embed_dim=cfg.token_embed_dim,
+        )
+        self.head = CrossPVT_T2T_MambaHead(head_cfg)
+
+    def load_head_from_safetensors(self, safetensors_path: Path) -> None:
+        sd = safetensors_load_file(str(safetensors_path))
+        head_sd = {k[len("head.") :]: v for k, v in sd.items() if k.startswith("head.")}
+        missing, unexpected = self.head.load_state_dict(head_sd, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(f"head load_state_dict 不匹配：missing={missing[:10]} unexpected={unexpected[:10]}")
+
+    def forward(self, pixel_values=None, labels=None):
+        if pixel_values.device != self.backbone_device:
+            pixel_values_bb = pixel_values.to(device=self.backbone_device, non_blocking=True)
+        else:
+            pixel_values_bb = pixel_values
+
+        tok_small = encode_tiles_infer(
+            pixel_values_bb, self.backbone, self.backbone_transform, self.cfg.small_grid, dtype=self.dtype
+        )
+        tok_big = encode_tiles_infer(
+            pixel_values_bb, self.backbone, self.backbone_transform, self.cfg.big_grid, dtype=self.dtype
+        )
+
+        if tok_small.device != self.head_device:
+            tok_small = tok_small.to(device=self.head_device, non_blocking=True)
+        if tok_big.device != self.head_device:
+            tok_big = tok_big.to(device=self.head_device, non_blocking=True)
+
+        out = self.head(tok_small, tok_big, self.cfg.small_grid, return_features=False)
+        green = out["green"]
+        clover = out["clover"]
+        dead = out["dead"]
+        gdm = green + clover
+        total = green + clover + dead
+        logits = torch.cat([green, dead, clover, gdm, total], dim=1)  # [B, 5]
+        return {"logits": logits}
 
 
 # %%
@@ -844,9 +918,8 @@ def _ensure_cache_memmaps(
         mm.flush()
         del mm
 
-    np_dtype = np.float16 if CACHE_DTYPE == "fp16" else np.float32
-    _init_file(small_path, (n, small_tiles, feat_dim), np_dtype)
-    _init_file(big_path, (n, big_tiles, feat_dim), np_dtype)
+    _init_file(small_path, (n, small_tiles, feat_dim), np.float16)
+    _init_file(big_path, (n, big_tiles, feat_dim), np.float16)
 
     meta = {
         "n": n,
@@ -871,9 +944,8 @@ def _open_cache_memmaps(
     feat_dim: int,
     mode: str,
 ) -> tuple[np.memmap, np.memmap]:
-    np_dtype = np.float16 if CACHE_DTYPE == "fp16" else np.float32
-    tok_small = np.memmap(small_path, mode=mode, dtype=np_dtype, shape=(n, small_tiles, feat_dim))
-    tok_big = np.memmap(big_path, mode=mode, dtype=np_dtype, shape=(n, big_tiles, feat_dim))
+    tok_small = np.memmap(small_path, mode=mode, dtype=np.float16, shape=(n, small_tiles, feat_dim))
+    tok_big = np.memmap(big_path, mode=mode, dtype=np.float16, shape=(n, big_tiles, feat_dim))
     return tok_small, tok_big
 
 
@@ -907,17 +979,8 @@ def _vit_precompute_worker(
     device = torch.device(f"cuda:{device_id}")
     dtype = torch.float16 if dtype_str == "fp16" else torch.bfloat16
 
-    # ViT + transform
-    # - thread 后端：可选走“CPU 只加载一次 -> clone 到各 GPU”的共享模型，避免 CPU 同时存在两份 ViT
-    # - process 后端：每个进程各自加载（隔离更强）
-    if PARALLEL_BACKEND == "thread" and VIT_INIT_CPU_ONCE_CLONE_TO_GPU:
-        backbone, backbone_transform = _VIT_THREAD_MODELS[device_id]
-        # 确保 dtype/设备正确
-        backbone = backbone.to(device=device, dtype=dtype).eval()
-    else:
-        backbone, backbone_transform = build_vit_backbone(
-            vit_name=CFG.vit_name, vit_ckpt=CFG.vit_checkpoint, device=device, dtype=dtype
-        )
+    # ViT
+    backbone, _ = build_vit_backbone(vit_name=CFG.vit_name, vit_ckpt=CFG.vit_checkpoint, device=device, dtype=dtype)
 
     tok_small_mm, tok_big_mm = _open_cache_memmaps(
         small_path=small_path,
@@ -936,22 +999,15 @@ def _vit_precompute_worker(
             imgs = [_load_image_tensor(image_root, image_paths[i]) for i in batch_idx.tolist()]
             x = torch.stack(imgs, dim=0).to(device=device, non_blocking=True)  # [B,3,H,W] float32
             # 编码
-            # 恢复原版预处理路径（exact_timm）时，这里会走 timm transform；否则走 fast_gpu
-            feats_small = encode_tiles_infer(x, backbone, backbone_transform, CFG.small_grid, dtype=dtype)  # [B,Ts,4096]
-            feats_big = encode_tiles_infer(x, backbone, backbone_transform, CFG.big_grid, dtype=dtype)  # [B,Tb,4096]
-            if CACHE_DTYPE == "fp32":
-                tok_small_mm[batch_idx, :, :] = feats_small.detach().to("cpu", torch.float32).numpy()
-                tok_big_mm[batch_idx, :, :] = feats_big.detach().to("cpu", torch.float32).numpy()
-            else:
-                tok_small_mm[batch_idx, :, :] = feats_small.detach().to("cpu", torch.float16).numpy()
-                tok_big_mm[batch_idx, :, :] = feats_big.detach().to("cpu", torch.float16).numpy()
+            feats_small = encode_tiles_fast(x, backbone, CFG.small_grid, dtype=dtype)  # [B,Ts,4096]
+            feats_big = encode_tiles_fast(x, backbone, CFG.big_grid, dtype=dtype)  # [B,Tb,4096]
+            tok_small_mm[batch_idx, :, :] = feats_small.detach().to("cpu", torch.float16).numpy()
+            tok_big_mm[batch_idx, :, :] = feats_big.detach().to("cpu", torch.float16).numpy()
             tok_small_mm.flush()
             tok_big_mm.flush()
 
     del tok_small_mm, tok_big_mm
-    # thread 后端下 backbone 是共享的，不在 worker 里 del
-    if not (PARALLEL_BACKEND == "thread" and VIT_INIT_CPU_ONCE_CLONE_TO_GPU):
-        del backbone
+    del backbone
     torch.cuda.empty_cache()
 
 
@@ -977,12 +1033,7 @@ def _load_fold_head_model(device: torch.device, dtype: torch.dtype, fold: int) -
         vit_feat_dim=CFG.vit_feat_dim,
         token_embed_dim=CFG.token_embed_dim,
     )
-    if HEAD_WEIGHT_DTYPE == "fp32":
-        head = CrossPVT_T2T_MambaHead(head_cfg).to(device=device, dtype=torch.float32).eval()
-    elif HEAD_WEIGHT_DTYPE == "bf16":
-        head = CrossPVT_T2T_MambaHead(head_cfg).to(device=device, dtype=torch.bfloat16).eval()
-    else:
-        head = CrossPVT_T2T_MambaHead(head_cfg).to(device=device, dtype=torch.float16).eval()
+    head = CrossPVT_T2T_MambaHead(head_cfg).to(device=device, dtype=dtype).eval()
 
     w = KAGGLE_HEAD_5FOLD_DIR / f"fold{fold}" / "model.safetensors"
     if not w.exists():
@@ -1002,12 +1053,7 @@ def _head_forward_to_logits(
     tok_big: torch.Tensor,
     small_grid: Tuple[int, int],
 ) -> torch.Tensor:
-    if USE_AUTOCAST_FOR_HEAD and tok_small.is_cuda:
-        # Trainer(fp16/bf16) 的 eval 通常会启用 autocast；这里模拟同类行为以减小差异
-        with torch.autocast(device_type="cuda", dtype=tok_small.dtype):
-            out = head(tok_small, tok_big, small_grid, return_features=False)
-    else:
-        out = head(tok_small, tok_big, small_grid, return_features=False)
+    out = head(tok_small, tok_big, small_grid, return_features=False)
     green = out["green"]
     clover = out["clover"]
     dead = out["dead"]
@@ -1051,17 +1097,10 @@ def _head_infer_worker(
     with torch.no_grad():
         for start in range(0, len(indices), head_batch_size):
             batch_idx = indices[start : start + head_batch_size]
-            # 缓存读取：fp32 更贴近原始特征；之后再转成 head 需要的 dtype
-            if CACHE_DTYPE == "fp32":
-                small_np = np.asarray(tok_small_mm[batch_idx, :, :], dtype=np.float32)
-                big_np = np.asarray(tok_big_mm[batch_idx, :, :], dtype=np.float32)
-                tok_small = torch.from_numpy(small_np).to(device=device, dtype=dtype, non_blocking=True)
-                tok_big = torch.from_numpy(big_np).to(device=device, dtype=dtype, non_blocking=True)
-            else:
-                small_np = np.asarray(tok_small_mm[batch_idx, :, :], dtype=np.float16)
-                big_np = np.asarray(tok_big_mm[batch_idx, :, :], dtype=np.float16)
-                tok_small = torch.from_numpy(small_np).to(device=device, dtype=dtype, non_blocking=True)
-                tok_big = torch.from_numpy(big_np).to(device=device, dtype=dtype, non_blocking=True)
+            small_np = np.asarray(tok_small_mm[batch_idx, :, :], dtype=np.float16)
+            big_np = np.asarray(tok_big_mm[batch_idx, :, :], dtype=np.float16)
+            tok_small = torch.from_numpy(small_np).to(device=device, dtype=dtype, non_blocking=True)
+            tok_big = torch.from_numpy(big_np).to(device=device, dtype=dtype, non_blocking=True)
 
             logits_sum = None
             for head in heads:
@@ -1099,41 +1138,32 @@ def run_predict_5fold_fast_cached() -> Path:
 
     # 1) ViT 预计算（双进程/双卡）
     idx_splits = _split_indices(n, parts=2)
-    backend = PARALLEL_BACKEND
-    if backend == "process" and _in_notebook():
-        print("[WARN] Notebook 环境下 process/spawn 容易 pickle 失败，已自动切换为 thread 后端。")
-        backend = "thread"
-
-    # thread 后端下：提前把 ViT 常驻到两张 GPU（每卡一份），供两个线程复用
-    if backend == "thread" and VIT_INIT_CPU_ONCE_CLONE_TO_GPU:
-        _init_vit_models_for_thread_backend(GPU_IDS, dtype=dtype)
-
-    vit_jobs = []
+    ctx = mp.get_context("spawn")
+    procs = []
     for proc_i, dev in enumerate(GPU_IDS):
-        vit_jobs.append(
-            (
-                _vit_precompute_worker,
-                dict(
-                    device_id=dev,
-                    indices=idx_splits[proc_i],
-                    image_paths=image_paths,
-                    image_root=IMAGE_ROOT,
-                    small_path=small_path,
-                    big_path=big_path,
-                    n=n,
-                    small_tiles=small_tiles,
-                    big_tiles=big_tiles,
-                    feat_dim=feat_dim,
-                    vit_batch_size=VIT_BATCH_SIZE,
-                    dtype_str=dtype_str,
-                ),
-            )
+        p = ctx.Process(
+            target=_vit_precompute_worker,
+            kwargs=dict(
+                device_id=dev,
+                indices=idx_splits[proc_i],
+                image_paths=image_paths,
+                image_root=IMAGE_ROOT,
+                small_path=small_path,
+                big_path=big_path,
+                n=n,
+                small_tiles=small_tiles,
+                big_tiles=big_tiles,
+                feat_dim=feat_dim,
+                vit_batch_size=VIT_BATCH_SIZE,
+                dtype_str=dtype_str,
+            ),
         )
-    _run_parallel_jobs(vit_jobs, backend=backend)
-
-    # ViT 预计算已结束：如果使用 thread 后端的全局 ViT 缓存，此处可以立刻释放显存给 head 阶段使用
-    if backend == "thread" and VIT_INIT_CPU_ONCE_CLONE_TO_GPU:
-        _clear_vit_models_for_thread_backend(gpu_ids=GPU_IDS)
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"ViT 预计算子进程异常退出：exitcode={p.exitcode}")
 
     # 2) head 推理（双进程/双卡），每卡各加载 5 个 head，对数据分片
     pred_path = CACHE_DIR / "pred.fp32.mmap"
@@ -1141,27 +1171,30 @@ def run_predict_5fold_fast_cached() -> Path:
     pred_mm.flush()
     del pred_mm
 
-    head_jobs = []
+    procs = []
     for proc_i, dev in enumerate(GPU_IDS):
-        head_jobs.append(
-            (
-                _head_infer_worker,
-                dict(
-                    device_id=dev,
-                    indices=idx_splits[proc_i],
-                    small_path=small_path,
-                    big_path=big_path,
-                    pred_path=pred_path,
-                    n=n,
-                    small_tiles=small_tiles,
-                    big_tiles=big_tiles,
-                    feat_dim=feat_dim,
-                    head_batch_size=HEAD_BATCH_SIZE,
-                    dtype_str=dtype_str,
-                ),
-            )
+        p = ctx.Process(
+            target=_head_infer_worker,
+            kwargs=dict(
+                device_id=dev,
+                indices=idx_splits[proc_i],
+                small_path=small_path,
+                big_path=big_path,
+                pred_path=pred_path,
+                n=n,
+                small_tiles=small_tiles,
+                big_tiles=big_tiles,
+                feat_dim=feat_dim,
+                head_batch_size=HEAD_BATCH_SIZE,
+                dtype_str=dtype_str,
+            ),
         )
-    _run_parallel_jobs(head_jobs, backend=backend)
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"head 推理子进程异常退出：exitcode={p.exitcode}")
 
     # 3) 聚合写 submission
     pred_mm = np.memmap(pred_path, mode="r", dtype=np.float32, shape=(n, 5))
@@ -1181,10 +1214,141 @@ def run_predict_5fold_fast_cached() -> Path:
     return out_csv
 
 
+
+# %%
+# =============================================================================
+# 推理 + 生成 submission.csv（Trainer.predict）
+# =============================================================================
+def make_submission_from_image_preds(
+    *,
+    test_csv: Path,
+    image_ids: List[str],
+    image_pred_5: np.ndarray,
+    out_csv: Path,
+) -> Path:
+    test_df = pd.read_csv(test_csv)
+    test_df["image_id"] = test_df["sample_id"].astype(str).str.split("__", n=1).str[0]
+
+    pred_df = pd.DataFrame(image_pred_5, columns=list(TARGET_COLS))
+    pred_df["image_id"] = image_ids
+
+    merged = test_df.merge(pred_df, on="image_id", how="left")
+    if merged[list(TARGET_COLS)].isna().any().any():
+        raise RuntimeError("merge 后存在缺失预测：请检查 image_id 对齐是否一致")
+
+    # 每行根据 target_name 选择对应列
+    def pick_row(r):
+        return float(r[r["target_name"]])
+
+    merged["target"] = merged.apply(pick_row, axis=1)
+    sub = merged[["sample_id", "target"]].copy()
+    out_csv = Path(out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    sub.to_csv(out_csv, index=False)
+    return out_csv
+
+
+def run_predict_5fold() -> Path:
+    # 设备选择：默认 head 在 cuda:0；若启用模型并行且 >=2 GPU，则 backbone=cuda:0, head=cuda:1
+    if torch.cuda.is_available():
+        n_gpu = torch.cuda.device_count()
+    else:
+        n_gpu = 0
+
+    if USE_MODEL_PARALLEL and n_gpu >= 2:
+        backbone_device = torch.device(BACKBONE_DEVICE_STR)
+        head_device = torch.device(HEAD_DEVICE_STR)
+    else:
+        # 回退：单卡/CPU
+        head_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        backbone_device = head_device
+
+    dtype = pick_infer_dtype()
+
+    # 1) ViT backbone（单独目录加载）
+    backbone, backbone_transform = build_vit_backbone(
+        vit_name=CFG.vit_name,
+        vit_ckpt=CFG.vit_checkpoint,
+        device=backbone_device,
+        dtype=dtype,
+    )
+
+    # 2) dataset（图片级去重）
+    ds = BiomassHFTestImageDataset(TEST_CSV, IMAGE_ROOT)
+
+    # 3) TrainingArguments（每折复用；Trainer/model 每折重建以便显存释放）
+    args = TrainingArguments(
+        output_dir=str(OUTPUT_DIR / "tmp_trainer"),
+        per_device_eval_batch_size=PER_DEVICE_BATCH_SIZE,
+        dataloader_num_workers=NUM_WORKERS,
+        report_to="none",
+        remove_unused_columns=False,
+        bf16=(dtype == torch.bfloat16),
+        fp16=(dtype == torch.float16),
+        # 只用单进程单卡（Trainer 内部的 device 仍然是 head_device；backbone 在 forward 里手动搬运）
+    )
+
+    # 4) 逐 fold 推理（常驻 1 个 head；推理后释放）
+    pred_sum: np.ndarray | None = None
+    for fold in FOLDS:
+        w = KAGGLE_HEAD_5FOLD_DIR / f"fold{fold}" / "model.safetensors"
+        if not w.exists():
+            raise FileNotFoundError(f"找不到 fold{fold} 权重: {w}")
+
+        model = HFSingleFoldWrapper(
+            cfg=CFG,
+            backbone=backbone,
+            backbone_transform=backbone_transform,
+            dtype=dtype,
+            backbone_device=backbone_device,
+            head_device=head_device,
+        ).to(device=head_device, dtype=dtype)
+        model.load_head_from_safetensors(w)
+
+        trainer = Trainer(
+            model=model,
+            args=args,
+            data_collator=data_collator_infer,
+        )
+
+        pred = trainer.predict(ds)
+        image_pred_5 = pred.predictions
+        if isinstance(image_pred_5, (tuple, list)):
+            image_pred_5 = image_pred_5[0]
+        image_pred_5 = np.asarray(image_pred_5, dtype=np.float32)
+        assert image_pred_5.shape[1] == 5, f"预测维度不对: {image_pred_5.shape}"
+
+        if pred_sum is None:
+            pred_sum = image_pred_5
+        else:
+            pred_sum = pred_sum + image_pred_5
+
+        # 释放当前 fold 的 head 显存
+        del trainer
+        del model
+        if head_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    assert pred_sum is not None
+    image_pred_5 = pred_sum / float(len(FOLDS))
+
+    out_csv = OUTPUT_DIR / "submission.csv"
+    make_submission_from_image_preds(
+        test_csv=TEST_CSV,
+        image_ids=ds.image_ids,
+        image_pred_5=image_pred_5,
+        out_csv=out_csv,
+    )
+    return out_csv
+
+
 # %%
 if __name__ == "__main__":
-    # Kaggle 只需要跑这句就能生成 submission.csv（FAST 双卡缓存推理）
-    out = run_predict_5fold_fast_cached()
+    # Kaggle 只需要跑这句就能生成 submission.csv
+    if FAST_INFER:
+        out = run_predict_5fold_fast_cached()
+    else:
+        out = run_predict_5fold()
     print(f"[OK] saved: {out}")
 
 

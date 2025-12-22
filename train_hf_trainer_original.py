@@ -1,10 +1,10 @@
 """
 使用 HuggingFace Trainer 训练 CrossPVT_T2T_MambaDINO 头（ViT-7B frozen 特征）。
 
-特性：
-- 基于 State holdout（如 NSW）划分训练/验证。
-- 支持 5 种输出模式（实验规划中的任意 3 个预测 + 规则推导 2 个）。
-- 输出完整 5 个目标用于加权 R² 评估。
+相比自定义循环，简化为：
+- Trainer 负责 epoch/日志/保存。
+- Dataset 返回 dict，DataCollator 直接堆叠。
+- forward 返回 loss/logits，compute_metrics 计算加权 R²。
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import timm
 import math
 
 TARGET_COLS = ("Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g")
+AUX_COLS = ("Pre_GSHH_NDVI", "Height_Ave_cm")
 WEIGHTS = {
     "Dry_Green_g": 0.1,
     "Dry_Dead_g": 0.1,
@@ -37,15 +38,123 @@ WEIGHTS = {
     "Dry_Total_g": 0.5,
 }
 
-OUTPUT_MODES: Dict[str, Tuple[str, str, str]] = {
-    "exp1": ("Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g"),
-    "exp2": ("Dry_Clover_g", "Dry_Total_g", "Dry_Green_g"),
-    "exp3": ("Dry_Total_g", "Dry_Dead_g", "Dry_Green_g"),
-    "exp4": ("GDM_g", "Dry_Clover_g", "Dry_Dead_g"),
-    "exp5": ("GDM_g", "Dry_Green_g", "Dry_Dead_g"),
-    "exp6": ("Dry_Clover_g", "Dry_Total_g", "GDM_g"),
-    "exp7": ("Dry_Green_g", "Dry_Total_g", "GDM_g"),
-}
+# =============================================================================
+# Fold helpers (ported from fold_split.ipynb)
+# =============================================================================
+SEED = 42
+N_SPLITS = 5
+
+def fix_zero_cells_by_move(
+    meta: pd.DataFrame,
+    key_col: str = "stratify_key",
+    group_col: str = "image_id",
+    fold_col: str = "fold",
+    max_passes: int = 50,
+    seed: int = 42,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    meta = meta.copy()
+    for _ in range(max_passes):
+        ct = pd.crosstab(meta[fold_col], meta[key_col])
+        zeros = np.argwhere(ct.to_numpy() == 0)
+        if len(zeros) == 0:
+            break
+        changed = False
+        folds = ct.index.to_list()
+        keys = ct.columns.to_list()
+        rng.shuffle(zeros)
+        for i, j in zeros:
+            recv_fold = folds[i]
+            key = keys[j]
+            col = ct[key]
+            donor_fold = col.idxmax()
+            if col.loc[donor_fold] <= 1:
+                continue
+            candidates = meta[(meta[fold_col] == donor_fold) & (meta[key_col] == key)]
+            if candidates.empty:
+                continue
+            pick = candidates.sample(1, random_state=int(rng.integers(0, 1_000_000_000))).index[0]
+            meta.loc[pick, fold_col] = recv_fold
+            ct = pd.crosstab(meta[fold_col], meta[key_col])
+            changed = True
+        if not changed:
+            break
+    return meta
+
+def add_season_column(df: pd.DataFrame, date_col: str = "Sampling_Date") -> pd.DataFrame:
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    m = df[date_col].dt.month
+    df["Season"] = np.select(
+        [m.isin([12, 1, 2]), m.isin([3, 4, 5]), m.isin([6, 7, 8]), m.isin([9, 10, 11])],
+        ["summer", "autumn", "winter", "spring"],
+        default="unknown",
+    )
+    return df
+
+def make_folds_state_season(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["image_id"] = df["sample_id"].str.split("__").str[0]
+    df = add_season_column(df, "Sampling_Date")
+
+    meta = df.drop_duplicates("image_id")[["image_id", "State", "Season"]].copy().reset_index(drop=True)
+    meta["State"] = meta["State"].fillna("Unknown")
+    meta["Season"] = meta["Season"].fillna("Unknown")
+    meta["stratify_key"] = meta["State"].astype(str) + "|" + meta["Season"].astype(str)
+
+    meta["fold"] = -1
+    try:
+        from sklearn.model_selection import StratifiedGroupKFold
+
+        sgkf = StratifiedGroupKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+        for fold, (_, va_idx) in enumerate(sgkf.split(meta, y=meta["stratify_key"], groups=meta["image_id"])):
+            meta.loc[va_idx, "fold"] = fold
+    except Exception:
+        rng = np.random.default_rng(SEED)
+        keys = meta["stratify_key"].unique().tolist()
+        rng.shuffle(keys)
+        fold_counts = [0] * N_SPLITS
+        fold_key_counts = [dict() for _ in range(N_SPLITS)]
+        global_key_counts = meta["stratify_key"].value_counts().to_dict()
+        total_n = len(meta)
+        key_groups = meta.groupby("stratify_key")["image_id"].apply(list).to_dict()
+        keys_sorted = sorted(key_groups.keys(), key=lambda k: len(key_groups[k]), reverse=True)
+
+        for k in keys_sorted:
+            imgs = key_groups[k]
+            rng.shuffle(imgs)
+            for image_id in imgs:
+                best_fold = None
+                best_score = None
+                for f in range(N_SPLITS):
+                    new_total = fold_counts[f] + 1
+                    desired_total = total_n / N_SPLITS
+                    new_key_cnt = fold_key_counts[f].get(k, 0) + 1
+                    desired_key = global_key_counts[k] / N_SPLITS
+                    score = (new_total - desired_total) ** 2 + 3.0 * (new_key_cnt - desired_key) ** 2
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_fold = f
+                fold_counts[best_fold] += 1
+                fold_key_counts[best_fold][k] = fold_key_counts[best_fold].get(k, 0) + 1
+                meta.loc[meta["image_id"] == image_id, "fold"] = best_fold
+        undecided = meta["fold"] < 0
+        if undecided.any():
+            meta.loc[undecided, "fold"] = rng.integers(0, N_SPLITS, size=undecided.sum())
+
+    df = df.merge(meta[["image_id", "fold"]], on="image_id", how="left")
+    return df
+
+def add_fold_column(df: pd.DataFrame) -> pd.DataFrame:
+    df = make_folds_state_season(df)
+    meta = df.drop_duplicates("image_id")[["image_id", "State", "Sampling_Date", "fold"]].copy()
+    meta = add_season_column(meta, "Sampling_Date")
+    meta["State"] = meta["State"].fillna("Unknown")
+    meta["Season"] = meta["Season"].fillna("Unknown")
+    meta["stratify_key"] = meta["State"].astype(str) + "|" + meta["Season"].astype(str)
+    meta_fixed = fix_zero_cells_by_move(meta, key_col="stratify_key", group_col="image_id", fold_col="fold")
+    df = df.drop(columns=["fold"]).merge(meta_fixed[["image_id", "fold"]], on="image_id", how="left")
+    return df
 
 
 # =============================================================================
@@ -344,7 +453,7 @@ class PyramidMixer(nn.Module):
 
 
 class CrossPVT_T2T_MambaHead(nn.Module):
-    def __init__(self, cfg: "HFConfig"):
+    def __init__(self, cfg: HFConfig):
         super().__init__()
         self.feat_dim = cfg.vit_feat_dim
         self.token_embed = nn.Linear(cfg.vit_feat_dim, cfg.token_embed_dim)
@@ -375,15 +484,10 @@ class CrossPVT_T2T_MambaHead(nn.Module):
                 nn.Linear(hidden, 1),
             )
 
-        self.heads = nn.ModuleDict(
-            {
-                "Dry_Green_g": head(),
-                "Dry_Clover_g": head(),
-                "Dry_Dead_g": head(),
-                "GDM_g": head(),
-                "Dry_Total_g": head(),
-            }
-        )
+        self.head_green = head()
+        self.head_clover = head()
+        self.head_dead = head()
+        self.score_head = nn.Sequential(nn.LayerNorm(combined), nn.Linear(combined, 1))
         self.aux_head = (
             nn.Sequential(nn.LayerNorm(cfg.pyramid_dims[1]), nn.Linear(cfg.pyramid_dims[1], len(TARGET_COLS)))
             if cfg.aux_head
@@ -406,8 +510,17 @@ class CrossPVT_T2T_MambaHead(nn.Module):
         feat, feat_maps = self.pyramid(fused)
         feat_maps["stage1_map"] = stage1_map
 
-        preds = {k: self.softplus(head(feat)) for k, head in self.heads.items()}
-        out: Dict[str, torch.Tensor] = {"preds": preds, "score_feat": feat}
+        green_pos = self.softplus(self.head_green(feat))
+        clover_pos = self.softplus(self.head_clover(feat))
+        dead_pos = self.softplus(self.head_dead(feat))
+
+
+        out: Dict[str, torch.Tensor] = {
+            "green": green_pos,
+            "dead": dead_pos,
+            "clover": clover_pos,
+            "score_feat": feat,
+        }
         if self.aux_head is not None:
             aux_tokens = feat_maps["stage2_tokens"]
             aux_pred = self.softplus(self.aux_head(aux_tokens.mean(dim=1)))
@@ -419,7 +532,6 @@ class CrossPVT_T2T_MambaHead(nn.Module):
             }
         return out
 
-
 # =============================================================================
 # 配置
 # =============================================================================
@@ -427,7 +539,8 @@ class CrossPVT_T2T_MambaHead(nn.Module):
 class HFConfig:
     train_csv: Path = Path("csiro-biomass/train.csv")
     image_dir: Path = Path("csiro-biomass")
-    output_dir: Path = Path("runs/hf_trainer_state_cv")
+    output_dir: Path = Path("runs/hf_trainer")
+    folds: Tuple[int, ...] = (0, 1, 2, 3, 4)
     batch_size: int = 4
     num_workers: int = 4
     epochs: int = 5
@@ -438,9 +551,6 @@ class HFConfig:
     aux_head: bool = True
     label_smooth: float = 0.0
     bf16: bool = False
-    output_mode: str = "exp1"
-    holdout_state: str = "NSW"
-    nonneg_clamp: bool = True
 
     small_grid: Tuple[int, int] = (2, 4)
     big_grid: Tuple[int, int] = (1, 2)
@@ -460,7 +570,7 @@ class HFConfig:
     vit_input_size: int = 256
     vit_feat_dim: int = 4096
     token_embed_dim: int = 1024
-
+    
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -487,7 +597,6 @@ def build_feature_extractor(cfg: HFConfig) -> tuple[nn.Module, callable]:
     timm_transform = timm.data.create_transform(**data_config, is_training=False)
     return base, timm_transform
 
-
 @torch.no_grad()
 def encode_tiles(
     images: torch.Tensor,
@@ -509,6 +618,7 @@ def encode_tiles(
     tiles = torch.stack(tiles, dim=1)
     flat = tiles.view(-1, ch, tiles.shape[-2], tiles.shape[-1])
 
+    # timm 变换（包含 resize + normalize），逐 tile 处理；使用 CPU 以保证兼容性，再移回设备
     proc = []
     for t in flat:
         proc.append(backbone_transform(t.to(torch.float16)).unsqueeze(0))
@@ -520,6 +630,10 @@ def encode_tiles(
     feats = feats.view(bsz, -1, feats.shape[-1])
     return feats
 
+def pack_targets(out: Dict[str, torch.Tensor]) -> torch.Tensor:
+    clover = out["gdm"] - out["green"]
+    dead = out["total"] - out["gdm"]
+    return torch.cat([out["green"], dead, clover, out["gdm"], out["total"]], dim=1)
 
 # =============================================================================
 # 数据集与增强
@@ -545,7 +659,7 @@ def build_full_image_transform(train: bool) -> A.Compose:
             ],
             p=0.30 if train else 0.0,
         ),
-        A.Normalize(mean=(0, 0, 0), std=(1, 1, 1), max_pixel_value=255.0),
+        A.Normalize(mean=(0,0,0), std=(1,1,1), max_pixel_value=255.0),  # 先缩放到 0-1
         ToTensorV2(),
     ]
     return A.Compose(aug)
@@ -568,6 +682,7 @@ class BiomassHFDataset(Dataset):
             raise FileNotFoundError(f"image not found: {img_path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img_t = self.transform(image=img)["image"]
+        # 提供完整 5 列标签，顺序与 TARGET_COLS 对齐
         labels = torch.tensor([row[col] for col in TARGET_COLS], dtype=torch.float32)
         return {"pixel_values": img_t, "labels": labels}
 
@@ -587,7 +702,6 @@ class HFWrapper(nn.Module):
         self.cfg = cfg
         self.backbone = backbone
         self.backbone_transform = backbone_transform
-        self._keys_to_ignore_on_save = ["backbone"]
         self.head = CrossPVT_T2T_MambaHead(
             HFConfig(
                 dropout=cfg.dropout,
@@ -607,86 +721,44 @@ class HFWrapper(nn.Module):
                 t2t_depth=cfg.t2t_depth,
                 vit_name=cfg.vit_name,
                 vit_checkpoint=cfg.vit_checkpoint,
-                vit_feat_dim=cfg.vit_feat_dim,
-                token_embed_dim=cfg.token_embed_dim,
+                vit_feat_dim=4096,
+                token_embed_dim=1024,
             )
         )
         self.loss_aux_w = 0.4
         self.label_smooth = cfg.label_smooth
-        if cfg.output_mode not in OUTPUT_MODES:
-            raise ValueError(f"Unknown output_mode: {cfg.output_mode}")
-        self.base_cols = OUTPUT_MODES[cfg.output_mode]
-
-    def _derive_targets(self, preds: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        green = preds.get("Dry_Green_g")
-        clover = preds.get("Dry_Clover_g")
-        dead = preds.get("Dry_Dead_g")
-        gdm = preds.get("GDM_g")
-        total = preds.get("Dry_Total_g")
-
-        if self.cfg.output_mode == "exp1":
-            gdm = green + clover
-            total = green + clover + dead
-        elif self.cfg.output_mode == "exp2":
-            gdm = clover + green
-            dead = total - gdm
-        elif self.cfg.output_mode == "exp3":
-            clover = total - (dead + green)
-            gdm = clover + green
-        elif self.cfg.output_mode == "exp4":
-            green = gdm - clover
-            total = gdm + dead
-        elif self.cfg.output_mode == "exp5":
-            clover = gdm - green
-            total = gdm + dead
-        elif self.cfg.output_mode == "exp6":
-            green = gdm - clover
-            dead = total - (clover + green)
-        elif self.cfg.output_mode == "exp7":
-            clover = gdm - green
-            dead = total - (clover + green)
-
-        if self.cfg.nonneg_clamp:
-            green = F.relu(green)
-            clover = F.relu(clover)
-            dead = F.relu(dead)
-            gdm = F.relu(gdm)
-            total = F.relu(total)
-
-        return {
-            "Dry_Green_g": green,
-            "Dry_Dead_g": dead,
-            "Dry_Clover_g": clover,
-            "GDM_g": gdm,
-            "Dry_Total_g": total,
-        }
 
     def forward(self, pixel_values=None, labels=None):
         tok_small = encode_tiles(pixel_values, self.backbone, self.backbone_transform, self.cfg.small_grid)
         tok_big = encode_tiles(pixel_values, self.backbone, self.backbone_transform, self.cfg.big_grid)
         out = self.head(tok_small, tok_big, self.cfg.small_grid, return_features=False)
 
-        base_preds = {k: out["preds"][k] for k in self.base_cols}
-        full_preds = self._derive_targets({**out["preds"], **base_preds})
-        logits_result = torch.cat([full_preds[c] for c in TARGET_COLS], dim=1)
-        result = {"logits": logits_result}
+        green = out["green"]
+        clover = out["clover"]
+        dead = out["dead"]
 
+        gdm = green + clover
+        total = green + clover + dead
+
+        logits_loss = torch.cat([green, dead, clover], dim=1)
+        logits_result = torch.cat([green, dead, clover, gdm, total], dim=1)
+        result = {"logits": logits_result}
         if labels is not None:
-            idxs = [TARGET_COLS.index(c) for c in self.base_cols]
-            target_base = labels[:, idxs]
-            pred_base = torch.cat([base_preds[c] for c in self.base_cols], dim=1)
-            loss_main = F.smooth_l1_loss(pred_base, target_base, beta=self.label_smooth)
+            loss_main = F.smooth_l1_loss(logits_loss, labels[:,:3], beta=self.label_smooth)
             loss_aux = 0.0
             if self.cfg.aux_head and "aux" in out:
                 loss_aux = F.smooth_l1_loss(out["aux"], labels)
-            result["loss"] = loss_main + self.loss_aux_w * loss_aux
+            loss = loss_main + self.loss_aux_w * loss_aux
+            result["loss"] = loss
         return result
 
     def state_dict(self, *args, **kwargs):
+        # 保存时排除 backbone 权重，避免巨大的 7B 体积
         sd = super().state_dict(*args, **kwargs)
         return {k: v for k, v in sd.items() if not k.startswith("backbone.")}
 
     def load_state_dict(self, state_dict, strict: bool = False):
+        # 加载时忽略缺失的 backbone 键，确保兼容过滤后的 state_dict
         filtered = {k: v for k, v in state_dict.items() if not k.startswith("backbone.")}
         return super().load_state_dict(filtered, strict=False)
 
@@ -695,6 +767,7 @@ class HFWrapper(nn.Module):
 # 评估指标（加权 R²）
 # =============================================================================
 def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
+
     preds = eval_pred.predictions
     if isinstance(preds, tuple):
         preds = preds[0]
@@ -738,10 +811,11 @@ def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
 # 主流程
 # =============================================================================
 def parse_args():
-    ap = argparse.ArgumentParser(description="Train with HF Trainer (State holdout)")
+    ap = argparse.ArgumentParser(description="Train with HF Trainer")
     ap.add_argument("--train-csv", type=Path, default=HFConfig.train_csv)
     ap.add_argument("--image-dir", type=Path, default=HFConfig.image_dir)
     ap.add_argument("--output-dir", type=Path, default=HFConfig.output_dir)
+    ap.add_argument("--folds", type=str, default="0,1,2,3,4")
     ap.add_argument("--epochs", type=int, default=HFConfig.epochs)
     ap.add_argument("--batch-size", type=int, default=HFConfig.batch_size)
     ap.add_argument("--num-workers", type=int, default=HFConfig.num_workers)
@@ -749,59 +823,9 @@ def parse_args():
     ap.add_argument("--weight-decay", type=float, default=HFConfig.weight_decay)
     ap.add_argument("--dropout", type=float, default=HFConfig.dropout)
     ap.add_argument("--hidden-ratio", type=float, default=HFConfig.hidden_ratio)
-    ap.add_argument("--output-mode", type=str, default=HFConfig.output_mode, choices=sorted(OUTPUT_MODES.keys()))
-    ap.add_argument("--holdout-state", type=str, default=HFConfig.holdout_state)
-    ap.add_argument("--compare-modes", action="store_true")
-    ap.add_argument("--no-nonneg-clamp", action="store_true")
     ap.add_argument("--no-aux", action="store_true")
     ap.add_argument("--bf16", action="store_true")
     return ap.parse_args()
-
-
-def run_one(cfg: HFConfig, wide: pd.DataFrame, backbone: nn.Module, backbone_transform) -> Dict[str, float]:
-    train_df = wide[wide["state"] != cfg.holdout_state].reset_index(drop=True)
-    val_df = wide[wide["state"] == cfg.holdout_state].reset_index(drop=True)
-    print(f"Train rows (non-{cfg.holdout_state}): {len(train_df)}, Val rows ({cfg.holdout_state}): {len(val_df)}")
-
-    train_ds = BiomassHFDataset(train_df, cfg.image_dir, train=True)
-    val_ds = BiomassHFDataset(val_df, cfg.image_dir, train=False)
-
-    model = HFWrapper(cfg, backbone, backbone_transform)
-
-    args_tr = TrainingArguments(
-        output_dir=str(cfg.output_dir / f"{cfg.output_mode}_{cfg.holdout_state}"),
-        per_device_train_batch_size=cfg.batch_size,
-        per_device_eval_batch_size=cfg.batch_size,
-        num_train_epochs=cfg.epochs,
-        learning_rate=cfg.lr,
-        weight_decay=cfg.weight_decay,
-        dataloader_num_workers=cfg.num_workers,
-        logging_steps=20,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        bf16=cfg.bf16,
-        fp16=not cfg.bf16,
-        save_total_limit=5,
-        load_best_model_at_end=True,
-        # metric_for_best_model="weighted_r2",
-        # greater_is_better=True,
-        report_to="tensorboard",
-    )
-
-    trainer = Trainer(
-        model=model,
-        args=args_tr,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=8)],
-    )
-
-    trainer.train()
-    metrics = trainer.evaluate()
-    print(f"{cfg.output_mode} holdout eval metrics: {metrics}")
-    return metrics
 
 
 def main():
@@ -809,10 +833,12 @@ def main():
     accelerator = Accelerator()
     device = accelerator.device
 
+    folds = tuple(int(x) for x in str(args.folds).split(",") if x.strip() != "")
     cfg = HFConfig(
         train_csv=args.train_csv,
         image_dir=args.image_dir,
         output_dir=args.output_dir,
+        folds=folds,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         epochs=args.epochs,
@@ -822,40 +848,63 @@ def main():
         hidden_ratio=args.hidden_ratio,
         aux_head=not args.no_aux,
         bf16=args.bf16,
-        output_mode=args.output_mode,
-        holdout_state=args.holdout_state,
-        nonneg_clamp=not args.no_nonneg_clamp,
     )
 
+    # 数据划分
     df = pd.read_csv(cfg.train_csv)
-    df["image_id"] = df["sample_id"].str.split("__").str[0]
+    df = add_fold_column(df)
     wide = (
-        df.pivot_table(index=["image_id", "image_path"], columns="target_name", values="target")
+        df.pivot_table(index=["image_id", "image_path", "fold"], columns="target_name", values="target")
         .reset_index()
         .rename_axis(None, axis=1)
     )
-    wide = wide.merge(
-        df.drop_duplicates("image_id")[["image_id", "State"]].rename(columns={"State": "state"}),
-        on="image_id",
-        how="left",
-    )
 
+    # Backbone + timm transform
     backbone, backbone_transform = build_feature_extractor(HFConfig(device=device))
 
-    if args.compare_modes:
-        best_mode = None
-        best_score = None
-        for mode in sorted(OUTPUT_MODES.keys()):
-            cfg.output_mode = mode
-            print(f"\n===== Output Mode {mode} =====")
-            metrics = run_one(cfg, wide, backbone, backbone_transform)
-            score = float(metrics.get("eval_weighted_r2", metrics.get("weighted_r2", -1.0)))
-            if best_score is None or score > best_score:
-                best_score = score
-                best_mode = mode
-        print(f"\nBest mode on holdout {cfg.holdout_state}: {best_mode} (weighted_r2={best_score:.5f})")
-    else:
-        run_one(cfg, wide, backbone, backbone_transform)
+    for fold in folds:
+        print(f"\n===== Fold {fold} / {len(folds)} =====")
+        train_df = wide[wide["fold"] != fold].reset_index(drop=True)
+        val_df = wide[wide["fold"] == fold].reset_index(drop=True)
+
+        train_ds = BiomassHFDataset(train_df, cfg.image_dir, train=True)
+        val_ds = BiomassHFDataset(val_df, cfg.image_dir, train=False)
+
+        model = HFWrapper(cfg, backbone, backbone_transform)
+
+        args_tr = TrainingArguments(
+            output_dir=str(cfg.output_dir / f"fold{fold}"),
+            per_device_train_batch_size=cfg.batch_size,
+            per_device_eval_batch_size=cfg.batch_size,
+            num_train_epochs=cfg.epochs,
+            learning_rate=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            dataloader_num_workers=cfg.num_workers,
+            logging_steps=20,
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            bf16=cfg.bf16,
+            fp16=not cfg.bf16,
+            save_total_limit=10,
+            load_best_model_at_end=True,
+            metric_for_best_model="weighted_r2",
+            greater_is_better=True,
+            report_to="tensorboard",
+        )
+
+        trainer = Trainer(
+            model=model,
+            args=args_tr,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            data_collator=data_collator,
+            compute_metrics=compute_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=8)],
+        )
+
+        trainer.train()
+        metrics = trainer.evaluate()
+        print(f"Fold {fold} eval metrics: {metrics}")
 
 
 if __name__ == "__main__":

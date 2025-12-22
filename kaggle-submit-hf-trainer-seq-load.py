@@ -15,6 +15,8 @@ Kaggle 提交示例（Trainer + Dataset，5-fold head ensemble，timm ViT 单独
 - 本脚本为 **FAST 双卡缓存推理**：两阶段（ViT 预计算缓存 -> head 推理），最后写出 submission.csv
 """
 
+
+
 # %%
 import sys
 import math
@@ -37,16 +39,20 @@ import torch.nn.functional as F
 import timm
 from safetensors.torch import load_file as safetensors_load_file
 
+
+
 # %%
 # =============================================================================
 # 需要你按 Kaggle 实际情况替换的全局路径变量（我先假设一套）
 # =============================================================================
-KAGGLE_DATA_DIR = Path("/home/ecs-user/code/happen/kaggle-csrio")  # 里面有 csiro-biomass/test.csv + test/...
-KAGGLE_VIT_DIR = Path("/home/ecs-user/code/happen/kaggle-csrio/timm/vit_7b_patch16_dinov3.lvd1689m")  # 可选：本地 vit 权重目录（里面有 model.safetensors）
-KAGGLE_HEAD_5FOLD_DIR = Path("/home/ecs-user/code/happen/kaggle-csrio/runs/hf_trainer_A")  # A 格式目录
+KAGGLE_DATA_DIR = Path("/kaggle/input")  # 里面有 csiro-biomass/test.csv + test/...
+KAGGLE_VIT_DIR = Path("/kaggle/input/vit-dinov3/keras/default/2")  # 可选：本地 vit 权重目录（里面有 model.safetensors）
+KAGGLE_HEAD_5FOLD_DIR = Path("/kaggle/input/csiro-exp/transformers/default/3/hf_trainer_r2_opt/runs/hf_trainer_exp")  # A 格式目录
+EXP_MODE = "exp4"  # exp1 ~ exp7
+NONNEG_CLAMP = False  # 推导后的目标值是否裁剪为非负
 
 # 输出目录（Kaggle 工作目录可写）
-OUTPUT_DIR = Path("./kaggle_out")
+OUTPUT_DIR = Path("/kaggle/working/")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 你训练时的相对数据目录结构（与仓库一致）
@@ -76,11 +82,11 @@ CACHE_DTYPE = "fp32"  # "fp16" or "fp32"
 
 # Head 推理精度策略（为了更贴近 Trainer 的 AMP 行为）
 # - head 权重保持 fp32，forward 用 autocast（很多算子会自动选择更稳定的内部精度）
-HEAD_WEIGHT_DTYPE = "bf16"  # "fp32"（推荐）或 "fp16"/"bf16"
-USE_AUTOCAST_FOR_HEAD = False
+HEAD_WEIGHT_DTYPE = "fp32"  # "fp32"（推荐）或 "fp16"/"bf16"
+USE_AUTOCAST_FOR_HEAD = True
 
 # ViT 推理时是否也启用 autocast（进一步贴近 Trainer/AMP 行为）
-USE_AUTOCAST_FOR_VIT = False
+USE_AUTOCAST_FOR_VIT = True
 
 # Notebook 里 multiprocessing(spawn) 经常会因为函数无法从 __main__ 导入而报：
 # "Can't get attribute '_vit_precompute_worker' on <module '__main__' ...>"
@@ -126,37 +132,9 @@ def _run_parallel_jobs(jobs: list[tuple[callable, dict]], *, backend: str) -> No
 # thread 后端下的共享 ViT（每张 GPU 一份），避免每个线程各自从磁盘/Hub 加载
 _VIT_THREAD_MODELS: dict[int, tuple[nn.Module, object]] = {}
 
-
-def _create_vit_model_uninitialized_on_device(device: torch.device) -> nn.Module:
-    """
-    在指定 device 上创建与 ViT-7B 同结构的模型，但不从磁盘/Hub 加载权重（pretrained=False）。
-    通过 torch.set_default_device 尽量避免在 CPU 上分配巨型参数（对 7B 很关键）。
-    """
-    # torch.set_default_device 是全局的，尽量短时间使用
-    torch.set_default_device(str(device))
-    try:
-        if CFG.vit_load_from_hf_hub:
-            m = timm.create_model(
-                CFG.vit_hf_hub_id,
-                pretrained=False,
-                num_classes=0,
-                global_pool="avg",
-            )
-        else:
-            m = timm.create_model(
-                CFG.vit_name,
-                pretrained=False,
-                num_classes=0,
-                global_pool="avg",
-            )
-    finally:
-        torch.set_default_device("cpu")
-    return m
-
-
 def _init_vit_models_for_thread_backend(gpu_ids: Tuple[int, int], dtype: torch.dtype) -> None:
     """
-    thread 后端下的 ViT 常驻缓存：为每张 GPU 各创建一份 ViT（每个 GPU 一份），供 thread 后端并行使用。
+    CPU 上加载一次预训练 ViT，然后复制到多个 GPU（每个 GPU 一份），供 thread 后端并行使用。
     """
     global _VIT_THREAD_MODELS
     if _VIT_THREAD_MODELS:
@@ -181,7 +159,6 @@ def _init_vit_models_for_thread_backend(gpu_ids: Tuple[int, int], dtype: torch.d
         _VIT_THREAD_MODELS[dev_id] = (m, backbone_transform)
         
     gc.collect()
-
 
 def _clear_vit_models_for_thread_backend(*, gpu_ids: Tuple[int, int]) -> None:
     """
@@ -213,11 +190,24 @@ def _clear_vit_models_for_thread_backend(*, gpu_ids: Tuple[int, int]) -> None:
 
 
 
+
+
 # %%
 # =============================================================================
 # 目标列定义（需与训练一致）
 # =============================================================================
 TARGET_COLS = ("Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g")
+OUTPUT_MODES: Dict[str, Tuple[str, str, str]] = {
+    "exp1": ("Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g"),
+    "exp2": ("Dry_Clover_g", "Dry_Total_g", "Dry_Green_g"),
+    "exp3": ("Dry_Total_g", "Dry_Dead_g", "Dry_Green_g"),
+    "exp4": ("GDM_g", "Dry_Clover_g", "Dry_Dead_g"),
+    "exp5": ("GDM_g", "Dry_Green_g", "Dry_Dead_g"),
+    "exp6": ("Dry_Clover_g", "Dry_Total_g", "GDM_g"),
+    "exp7": ("Dry_Green_g", "Dry_Total_g", "GDM_g"),
+}
+
+
 
 
 # %%
@@ -259,6 +249,8 @@ class InferCFG:
 
 
 CFG = InferCFG()
+
+
 
 
 # %%
@@ -606,11 +598,15 @@ class CrossPVT_T2T_MambaHead(nn.Module):
                 nn.Linear(hidden, 1),
             )
 
-        self.head_green = head()
-        self.head_clover = head()
-        self.head_dead = head()
-        # 训练脚本里存在但未必参与 loss 的 score_head：为了 load_state_dict 完全一致，这里保留
-        self.score_head = nn.Sequential(nn.LayerNorm(combined), nn.Linear(combined, 1))
+        self.heads = nn.ModuleDict(
+            {
+                "Dry_Green_g": head(),
+                "Dry_Clover_g": head(),
+                "Dry_Dead_g": head(),
+                "GDM_g": head(),
+                "Dry_Total_g": head(),
+            }
+        )
         self.aux_head = (
             nn.Sequential(nn.LayerNorm(cfg.pyramid_dims[1]), nn.Linear(cfg.pyramid_dims[1], len(TARGET_COLS))) if cfg.aux_head else None
         )
@@ -631,11 +627,8 @@ class CrossPVT_T2T_MambaHead(nn.Module):
         feat, feat_maps = self.pyramid(fused)
         feat_maps["stage1_map"] = stage1_map
 
-        green_pos = self.softplus(self.head_green(feat))
-        clover_pos = self.softplus(self.head_clover(feat))
-        dead_pos = self.softplus(self.head_dead(feat))
-
-        out: Dict[str, torch.Tensor] = {"green": green_pos, "dead": dead_pos, "clover": clover_pos, "score_feat": feat}
+        preds = {k: self.softplus(head(feat)) for k, head in self.heads.items()}
+        out: Dict[str, torch.Tensor] = {"preds": preds, "score_feat": feat}
         if self.aux_head is not None:
             aux_tokens = feat_maps["stage2_tokens"]
             aux_pred = self.softplus(self.aux_head(aux_tokens.mean(dim=1)))
@@ -645,7 +638,14 @@ class CrossPVT_T2T_MambaHead(nn.Module):
         return out
 
 
+
+
 # %%
+# %%
+
+# %%
+
+
 # %%
 # =============================================================================
 # timm ViT：单独加载 + 冻结
@@ -807,6 +807,8 @@ def encode_tiles_infer(
     if VIT_PREPROCESS_MODE == "exact_timm":
         return encode_tiles_exact_timm_transform(images, backbone, backbone_transform, grid, dtype=dtype)
     return encode_tiles_fast(images, backbone, grid, dtype=dtype)
+
+
 
 
 # %%
@@ -984,7 +986,11 @@ def _load_fold_head_model(device: torch.device, dtype: torch.dtype, fold: int) -
     else:
         head = CrossPVT_T2T_MambaHead(head_cfg).to(device=device, dtype=torch.float16).eval()
 
-    w = KAGGLE_HEAD_5FOLD_DIR / f"fold{fold}" / "model.safetensors"
+    exp_dir = KAGGLE_HEAD_5FOLD_DIR / EXP_MODE
+    if exp_dir.is_dir():
+        w = exp_dir / f"fold{fold}" / "model.safetensors"
+    else:
+        w = KAGGLE_HEAD_5FOLD_DIR / f"fold{fold}" / "model.safetensors"
     if not w.exists():
         raise FileNotFoundError(f"找不到 fold{fold} 权重: {w}")
     sd = safetensors_load_file(str(w))
@@ -1008,11 +1014,45 @@ def _head_forward_to_logits(
             out = head(tok_small, tok_big, small_grid, return_features=False)
     else:
         out = head(tok_small, tok_big, small_grid, return_features=False)
-    green = out["green"]
-    clover = out["clover"]
-    dead = out["dead"]
-    gdm = green + clover
-    total = green + clover + dead
+    preds = out["preds"]
+
+    green = preds.get("Dry_Green_g")
+    clover = preds.get("Dry_Clover_g")
+    dead = preds.get("Dry_Dead_g")
+    gdm = preds.get("GDM_g")
+    total = preds.get("Dry_Total_g")
+
+    if EXP_MODE == "exp1":
+        gdm = green + clover
+        total = green + clover + dead
+    elif EXP_MODE == "exp2":
+        gdm = clover + green
+        dead = total - gdm
+    elif EXP_MODE == "exp3":
+        clover = total - (dead + green)
+        gdm = clover + green
+    elif EXP_MODE == "exp4":
+        green = gdm - clover
+        total = gdm + dead
+    elif EXP_MODE == "exp5":
+        clover = gdm - green
+        total = gdm + dead
+    elif EXP_MODE == "exp6":
+        green = gdm - clover
+        dead = total - (clover + green)
+    elif EXP_MODE == "exp7":
+        clover = gdm - green
+        dead = total - (clover + green)
+    else:
+        raise ValueError(f"Unknown EXP_MODE: {EXP_MODE}")
+
+    if NONNEG_CLAMP:
+        green = F.relu(green)
+        clover = F.relu(clover)
+        dead = F.relu(dead)
+        gdm = F.relu(gdm)
+        total = F.relu(total)
+
     return torch.cat([green, dead, clover, gdm, total], dim=1)  # [B,5]
 
 
@@ -1104,7 +1144,7 @@ def run_predict_5fold_fast_cached() -> Path:
         print("[WARN] Notebook 环境下 process/spawn 容易 pickle 失败，已自动切换为 thread 后端。")
         backend = "thread"
 
-    # thread 后端下：提前把 ViT 常驻到两张 GPU（每卡一份），供两个线程复用
+    # thread 后端下：先 CPU 加载一次 ViT，再 clone 到两张 GPU，避免 CPU 同时存在两份 ViT
     if backend == "thread" and VIT_INIT_CPU_ONCE_CLONE_TO_GPU:
         _init_vit_models_for_thread_backend(GPU_IDS, dtype=dtype)
 
@@ -1130,11 +1170,11 @@ def run_predict_5fold_fast_cached() -> Path:
             )
         )
     _run_parallel_jobs(vit_jobs, backend=backend)
-
+    
     # ViT 预计算已结束：如果使用 thread 后端的全局 ViT 缓存，此处可以立刻释放显存给 head 阶段使用
     if backend == "thread" and VIT_INIT_CPU_ONCE_CLONE_TO_GPU:
         _clear_vit_models_for_thread_backend(gpu_ids=GPU_IDS)
-
+    
     # 2) head 推理（双进程/双卡），每卡各加载 5 个 head，对数据分片
     pred_path = CACHE_DIR / "pred.fp32.mmap"
     pred_mm = np.memmap(pred_path, mode="w+", dtype=np.float32, shape=(n, 5))
@@ -1181,10 +1221,14 @@ def run_predict_5fold_fast_cached() -> Path:
     return out_csv
 
 
+
+
 # %%
 if __name__ == "__main__":
     # Kaggle 只需要跑这句就能生成 submission.csv（FAST 双卡缓存推理）
     out = run_predict_5fold_fast_cached()
     print(f"[OK] saved: {out}")
+
+
 
 

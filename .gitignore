@@ -209,3 +209,10 @@ __marimo__/
 
 #data
 csiro-biomass
+kaggle_out
+aug_preview
+aug_preview_test
+
+#model
+timm
+runs

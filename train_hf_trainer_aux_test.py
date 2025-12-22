@@ -1,37 +1,35 @@
 """
-Single-branch CrossPVT T2T Mamba training using ViT-7B (DINOv3) features.
+使用 HuggingFace Trainer 训练 CrossPVT_T2T_MambaDINO 头（ViT-7B frozen 特征）。
 
-- Uses the 5-fold split logic from fold_split.ipynb (State×Season stratify + zero-cell fix).
-- Does NOT split images into left/right halves; the full image is tiled into small/big grids.
-- The ViT backbone (vit_7b_patch16_dinov3.lvd1689m) is kept separate and used only as a
-  frozen feature extractor during data processing; the learning head operates on tokens.
+相比自定义循环，简化为：
+- Trainer 负责 epoch/日志/保存。
+- Dataset 返回 dict，DataCollator 直接堆叠。
+- forward 返回 loss/logits，compute_metrics 计算加权 R²。
 """
 
 from __future__ import annotations
 
 import argparse
-import math
-import os
-import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import albumentations as A
 import cv2
 import numpy as np
 import pandas as pd
-import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
 from albumentations.pytorch import ToTensorV2
+from torch.utils.data import Dataset
+from transformers import Trainer, TrainingArguments, EvalPrediction, EarlyStoppingCallback
+from accelerate import Accelerator
+import timm
+import math
 
-from data_enhance import train_tile_tfms_stable, val_tile_tfms
 TARGET_COLS = ("Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g")
+AUX_COLS = ("Pre_GSHH_NDVI", "Height_Ave_cm")
 WEIGHTS = {
     "Dry_Green_g": 0.1,
     "Dry_Dead_g": 0.1,
@@ -39,7 +37,18 @@ WEIGHTS = {
     "GDM_g": 0.2,
     "Dry_Total_g": 0.5,
 }
-
+OUTPUT_MODES: Dict[str, Tuple[str, str, str]] = {
+    "exp1": ("Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g"),
+    "exp2": ("Dry_Clover_g", "Dry_Total_g", "Dry_Green_g"),
+    "exp3": ("Dry_Total_g", "Dry_Dead_g", "Dry_Green_g"),
+    "exp4": ("GDM_g", "Dry_Clover_g", "Dry_Dead_g"),
+    "exp5": ("GDM_g", "Dry_Green_g", "Dry_Dead_g"),
+    "exp6": ("Dry_Clover_g", "Dry_Total_g", "GDM_g"),
+    "exp7": ("Dry_Green_g", "Dry_Total_g", "GDM_g"),
+}
+SEASON_LABELS = ("summer", "autumn", "winter", "spring")
+STATE_LABELS = ("NSW", "Tas", "Vic", "WA")
+SPECIES_COUNT = 15
 
 # =============================================================================
 # Fold helpers (ported from fold_split.ipynb)
@@ -47,6 +56,42 @@ WEIGHTS = {
 SEED = 42
 N_SPLITS = 5
 
+def fix_zero_cells_by_move(
+    meta: pd.DataFrame,
+    key_col: str = "stratify_key",
+    group_col: str = "image_id",
+    fold_col: str = "fold",
+    max_passes: int = 50,
+    seed: int = 42,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    meta = meta.copy()
+    for _ in range(max_passes):
+        ct = pd.crosstab(meta[fold_col], meta[key_col])
+        zeros = np.argwhere(ct.to_numpy() == 0)
+        if len(zeros) == 0:
+            break
+        changed = False
+        folds = ct.index.to_list()
+        keys = ct.columns.to_list()
+        rng.shuffle(zeros)
+        for i, j in zeros:
+            recv_fold = folds[i]
+            key = keys[j]
+            col = ct[key]
+            donor_fold = col.idxmax()
+            if col.loc[donor_fold] <= 1:
+                continue
+            candidates = meta[(meta[fold_col] == donor_fold) & (meta[key_col] == key)]
+            if candidates.empty:
+                continue
+            pick = candidates.sample(1, random_state=int(rng.integers(0, 1_000_000_000))).index[0]
+            meta.loc[pick, fold_col] = recv_fold
+            ct = pd.crosstab(meta[fold_col], meta[key_col])
+            changed = True
+        if not changed:
+            break
+    return meta
 
 def add_season_column(df: pd.DataFrame, date_col: str = "Sampling_Date") -> pd.DataFrame:
     df = df.copy()
@@ -58,7 +103,6 @@ def add_season_column(df: pd.DataFrame, date_col: str = "Sampling_Date") -> pd.D
         default="unknown",
     )
     return df
-
 
 def make_folds_state_season(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -113,45 +157,6 @@ def make_folds_state_season(df: pd.DataFrame) -> pd.DataFrame:
     df = df.merge(meta[["image_id", "fold"]], on="image_id", how="left")
     return df
 
-
-def fix_zero_cells_by_move(
-    meta: pd.DataFrame,
-    key_col: str = "stratify_key",
-    group_col: str = "image_id",
-    fold_col: str = "fold",
-    max_passes: int = 50,
-    seed: int = 42,
-) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    meta = meta.copy()
-    for _ in range(max_passes):
-        ct = pd.crosstab(meta[fold_col], meta[key_col])
-        zeros = np.argwhere(ct.to_numpy() == 0)
-        if len(zeros) == 0:
-            break
-        changed = False
-        folds = ct.index.to_list()
-        keys = ct.columns.to_list()
-        rng.shuffle(zeros)
-        for i, j in zeros:
-            recv_fold = folds[i]
-            key = keys[j]
-            col = ct[key]
-            donor_fold = col.idxmax()
-            if col.loc[donor_fold] <= 1:
-                continue
-            candidates = meta[(meta[fold_col] == donor_fold) & (meta[key_col] == key)]
-            if candidates.empty:
-                continue
-            pick = candidates.sample(1, random_state=int(rng.integers(0, 1_000_000_000))).index[0]
-            meta.loc[pick, fold_col] = recv_fold
-            ct = pd.crosstab(meta[fold_col], meta[key_col])
-            changed = True
-        if not changed:
-            break
-    return meta
-
-
 def add_fold_column(df: pd.DataFrame) -> pd.DataFrame:
     df = make_folds_state_season(df)
     meta = df.drop_duplicates("image_id")[["image_id", "State", "Sampling_Date", "fold"]].copy()
@@ -165,79 +170,7 @@ def add_fold_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# Config / utils
-# =============================================================================
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def init_distributed() -> tuple[int, int, int | None]:
-    """初始化分布式环境，返回 (rank, world_size, local_rank)。如果未使用分布式则返回 (0,1,None)。"""
-    if torch.distributed.is_available():
-        if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            return rank, world_size, local_rank
-        if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-            torch.distributed.init_process_group(backend="nccl")
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            torch.cuda.set_device(local_rank)
-            return rank, world_size, local_rank
-    return 0, 1, None
-
-
-def is_main_process(rank: int) -> bool:
-    return rank == 0
-
-
-@dataclass
-class TrainConfig:
-    train_csv: Path = Path("csiro-biomass/train.csv")
-    image_dir: Path = Path("csiro-biomass")
-    output_dir: Path = Path("runs/crosspvt_single")
-
-    num_epochs: int = 5
-    batch_size: int = 4
-    num_workers: int = 4
-    lr: float = 1e-4
-    weight_decay: float = 1e-4
-    dropout: float = 0.1
-    hidden_ratio: float = 0.35
-    aux_head: bool = True
-    label_smooth: float = 0.0
-    log_interval: int = 50
-
-    small_grid: Tuple[int, int] = (2, 4)
-    big_grid: Tuple[int, int] = (1, 2)
-    pyramid_dims: Tuple[int, int, int] = (768, 1024, 1280)
-    mamba_depth: int = 3
-    mamba_kernel: int = 5
-    mobilevit_heads: int = 4
-    mobilevit_depth: int = 2
-    sra_heads: int = 8
-    sra_ratio: int = 2
-    cross_heads: int = 8
-    cross_layers: int = 2
-    t2t_depth: int = 2
-
-    vit_name: str = "vit_7b_patch16_dinov3.lvd1689m"
-    vit_checkpoint: Path = Path("timm/vit_7b_patch16_dinov3.lvd1689m/model.safetensors")
-    vit_input_size: int = 256
-    vit_feat_dim: int = 4096
-    token_embed_dim: int = 1024
-
-    use_backbone_dp: bool = False  # torchrun 下每个进程一张卡，不再用 DataParallel
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# =============================================================================
-# Model blocks
+# 模型
 # =============================================================================
 class FeedForward(nn.Module):
     def __init__(self, dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
@@ -532,7 +465,7 @@ class PyramidMixer(nn.Module):
 
 
 class CrossPVT_T2T_MambaHead(nn.Module):
-    def __init__(self, cfg: TrainConfig):
+    def __init__(self, cfg: HFConfig):
         super().__init__()
         self.feat_dim = cfg.vit_feat_dim
         self.token_embed = nn.Linear(cfg.vit_feat_dim, cfg.token_embed_dim)
@@ -563,10 +496,19 @@ class CrossPVT_T2T_MambaHead(nn.Module):
                 nn.Linear(hidden, 1),
             )
 
-        self.head_green = head()
-        self.head_clover = head()
-        self.head_dead = head()
-        self.score_head = nn.Sequential(nn.LayerNorm(combined), nn.Linear(combined, 1))
+        self.heads = nn.ModuleDict(
+            {
+                "Dry_Green_g": head(),
+                "Dry_Clover_g": head(),
+                "Dry_Dead_g": head(),
+                "GDM_g": head(),
+                "Dry_Total_g": head(),
+            }
+        )
+        self.season_head = nn.Linear(combined, cfg.season_classes)
+        self.state_head = nn.Linear(combined, cfg.state_classes)
+        self.species_head = nn.Linear(combined, cfg.species_classes)
+        self.aux_reg_head = nn.Linear(combined, len(AUX_COLS))
         self.aux_head = (
             nn.Sequential(nn.LayerNorm(cfg.pyramid_dims[1]), nn.Linear(cfg.pyramid_dims[1], len(TARGET_COLS)))
             if cfg.aux_head
@@ -589,17 +531,14 @@ class CrossPVT_T2T_MambaHead(nn.Module):
         feat, feat_maps = self.pyramid(fused)
         feat_maps["stage1_map"] = stage1_map
 
-        green_pos = self.softplus(self.head_green(feat))
-        clover_pos = self.softplus(self.head_clover(feat))
-        dead_pos = self.softplus(self.head_dead(feat))
-        gdm = green_pos + clover_pos
-        total = gdm + dead_pos
-
+        preds = {k: self.softplus(head(feat)) for k, head in self.heads.items()}
         out: Dict[str, torch.Tensor] = {
-            "total": total,
-            "gdm": gdm,
-            "green": green_pos,
+            "preds": preds,
             "score_feat": feat,
+            "season_logits": self.season_head(feat),
+            "state_logits": self.state_head(feat),
+            "species_logits": self.species_head(feat),
+            "aux_reg": self.aux_reg_head(feat),
         }
         if self.aux_head is not None:
             aux_tokens = feat_maps["stage2_tokens"]
@@ -612,110 +551,63 @@ class CrossPVT_T2T_MambaHead(nn.Module):
             }
         return out
 
-
 # =============================================================================
-# Data
+# 配置
 # =============================================================================
-def build_full_image_transform(train: bool) -> A.Compose:
-    aug = [
-        A.OneOf(
-            [
-                A.HorizontalFlip(p=1.0),
-                A.VerticalFlip(p=1.0),
-                A.RandomRotate90(p=1.0),
-            ],
-            p=0.8 if train else 0.0,
-        ),
-        A.RandomBrightnessContrast(0.15, 0.15, p=0.6 if train else 0.0),
-        A.HueSaturationValue(8, 12, 8, p=0.4 if train else 0.0),
-        A.RandomGamma(gamma_limit=(85, 115), p=0.25 if train else 0.0),
-        A.OneOf(
-            [
-                A.ImageCompression(quality_range=(55, 95)),
-                A.GaussNoise(std_range=(0.02, 0.10)),
-                A.GaussianBlur(blur_limit=(3, 5)),
-                A.MotionBlur(blur_limit=3),
-            ],
-            p=0.30 if train else 0.0,
-        ),
-        ToTensorV2(),
-    ]
-    return A.Compose(aug)
+@dataclass
+class HFConfig:
+    train_csv: Path = Path("csiro-biomass/train.csv")
+    image_dir: Path = Path("csiro-biomass")
+    output_dir: Path = Path("runs/hf_trainer_auxtest")
+    folds: Tuple[int, ...] = (0, 1, 2, 3, 4)
+    batch_size: int = 4
+    num_workers: int = 4
+    epochs: int = 5
+    lr: float = 1e-5
+    weight_decay: float = 1e-4
+    dropout: float = 0.1
+    hidden_ratio: float = 0.35
+    aux_head: bool = True
+    label_smooth: float = 0.0
+    bf16: bool = False
+    output_mode: str = "exp1"
+    nonneg_clamp: bool = True
+    season_classes: int = len(SEASON_LABELS)
+    state_classes: int = len(STATE_LABELS)
+    species_classes: int = SPECIES_COUNT
+    loss_season_w: float = 0.2
+    loss_state_w: float = 0.2
+    loss_species_w: float = 0.2
+    loss_ndvi_w: float = 0.4
+    loss_height_w: float = 0.4
+    log1p_targets: bool = False
 
+    small_grid: Tuple[int, int] = (2, 4)
+    big_grid: Tuple[int, int] = (1, 2)
+    pyramid_dims: Tuple[int, int, int] = (768, 1024, 1280)
+    mamba_depth: int = 3
+    mamba_kernel: int = 5
+    mobilevit_heads: int = 4
+    mobilevit_depth: int = 2
+    sra_heads: int = 8
+    sra_ratio: int = 2
+    cross_heads: int = 8
+    cross_layers: int = 2
+    t2t_depth: int = 2
 
-class BiomassDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, image_dir: Path, transform: A.Compose):
-        self.df = df.reset_index(drop=True)
-        self.image_dir = image_dir
-        self.transform = transform
-
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        row = self.df.iloc[idx]
-        img_path = self.image_dir / row["image_path"]
-        img = cv2.imread(str(img_path))
-        if img is None:
-            raise FileNotFoundError(f"image not found: {img_path}")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img_t = self.transform(image=img)["image"]  # 仅做方向/颜色/轻度退化，无归一化
-        target = torch.tensor([row[col] for col in TARGET_COLS], dtype=torch.float32)
-        return img_t, target
-
-
-def build_dataloaders(cfg: TrainConfig, fold: int) -> Tuple[DataLoader, DataLoader, BiomassDataset]:
-    df = pd.read_csv(cfg.train_csv)
-    df = add_fold_column(df)
-    wide = (
-        df.pivot_table(index=["image_id", "image_path", "fold"], columns="target_name", values="target")
-        .reset_index()
-        .rename_axis(None, axis=1)
-    )
-    train_df = wide[wide["fold"] != fold].reset_index(drop=True)
-    val_df = wide[wide["fold"] == fold].reset_index(drop=True)
-
-    train_ds = BiomassDataset(train_df, cfg.image_dir, build_full_image_transform(train=True))
-    val_ds = BiomassDataset(val_df, cfg.image_dir, build_full_image_transform(train=False))
-
-    # 分布式采样器
-    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_ds, num_replicas=torch.distributed.get_world_size(), rank=torch.distributed.get_rank(), shuffle=True
-        )
-        val_sampler = torch.utils.data.distributed.DistributedSampler(
-            val_ds, num_replicas=torch.distributed.get_world_size(), rank=torch.distributed.get_rank(), shuffle=False
-        )
-        shuffle = False
-    else:
-        train_sampler = None
-        val_sampler = None
-        shuffle = True
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle if train_sampler is None else False,
-        sampler=train_sampler,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        sampler=val_sampler,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-    )
-    return train_loader, val_loader, val_ds
+    vit_name: str = "vit_7b_patch16_dinov3.lvd1689m"
+    vit_checkpoint: Path = Path("timm/vit_7b_patch16_dinov3.lvd1689m/model.safetensors")
+    vit_input_size: int = 256
+    vit_feat_dim: int = 4096
+    token_embed_dim: int = 1024
+    
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # =============================================================================
 # Feature extractor (ViT) separated from head
 # =============================================================================
-def build_feature_extractor(cfg: TrainConfig) -> tuple[nn.Module, callable]:
+def build_feature_extractor(cfg: HFConfig) -> tuple[nn.Module, callable]:
     if not cfg.vit_checkpoint.exists():
         raise FileNotFoundError(f"ViT checkpoint not found: {cfg.vit_checkpoint}")
     base = timm.create_model(
@@ -730,11 +622,10 @@ def build_feature_extractor(cfg: TrainConfig) -> tuple[nn.Module, callable]:
     base.eval()
     if not torch.cuda.is_available():
         print(">>> 未检测到 GPU，ViT 特征提取将在 CPU 上运行（较慢）")
-    base = base.to(cfg.device)
+    base = base.to(cfg.device).to(torch.bfloat16)
     data_config = timm.data.resolve_model_data_config(base)
     timm_transform = timm.data.create_transform(**data_config, is_training=False)
     return base, timm_transform
-
 
 @torch.no_grad()
 def encode_tiles(
@@ -761,138 +652,294 @@ def encode_tiles(
     proc = []
     for t in flat:
         proc.append(backbone_transform(t.to(torch.float16)).unsqueeze(0))
-    proc = torch.cat(proc, dim=0).to(images.device)
+    proc = torch.cat(proc, dim=0).to(images.device).to(torch.bfloat16)
+
+    assert proc.max() < 6 and proc.min() > -6, f"proc is not normalized to [0, 1] {proc.max()}"
 
     feats = backbone(proc)
     feats = feats.view(bsz, -1, feats.shape[-1])
     return feats
 
-
-# =============================================================================
-# Training / evaluation
-# =============================================================================
 def pack_targets(out: Dict[str, torch.Tensor]) -> torch.Tensor:
     clover = out["gdm"] - out["green"]
     dead = out["total"] - out["gdm"]
     return torch.cat([out["green"], dead, clover, out["gdm"], out["total"]], dim=1)
 
+# =============================================================================
+# 数据集与增强
+# =============================================================================
+def build_full_image_transform(train: bool) -> A.Compose:
+    aug = [
+        A.OneOf(
+            [
+                A.HorizontalFlip(p=1.0),
+                A.VerticalFlip(p=1.0),
+            ],
+            p=0.8 if train else 0.0,
+        ),
+        A.RandomBrightnessContrast(0.15, 0.15, p=0.6 if train else 0.0),
+        A.HueSaturationValue(8, 12, 8, p=0.4 if train else 0.0),
+        A.RandomGamma(gamma_limit=(85, 115), p=0.25 if train else 0.0),
+        A.OneOf(
+            [
+                A.ImageCompression(quality_range=(55, 95)),
+                A.GaussNoise(std_range=(0.02, 0.10)),
+                A.GaussianBlur(blur_limit=(3, 5)),
+                A.MotionBlur(blur_limit=3),
+            ],
+            p=0.30 if train else 0.0,
+        ),
+        A.Normalize(mean=(0,0,0), std=(1,1,1), max_pixel_value=255.0),  # 先缩放到 0-1
+        ToTensorV2(),
+    ]
+    return A.Compose(aug)
 
-def smooth_l1_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float = 0.0) -> torch.Tensor:
-    if smooth <= 0:
-        return F.l1_loss(pred, target)
-    return F.smooth_l1_loss(pred, target, beta=smooth)
+
+class BiomassHFDataset(Dataset):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        image_dir: Path,
+        train: bool,
+        season_map: Dict[str, int],
+        state_map: Dict[str, int],
+        species_map: Dict[str, int],
+    ):
+        self.df = df.reset_index(drop=True)
+        self.image_dir = image_dir
+        self.transform = build_full_image_transform(train=train)
+        self.season_map = season_map
+        self.state_map = state_map
+        self.species_map = species_map
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        img_path = self.image_dir / row["image_path"]
+        img = cv2.imread(str(img_path))
+        if img is None:
+            raise FileNotFoundError(f"image not found: {img_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_t = self.transform(image=img)["image"]
+        # 提供完整 5 列标签，顺序与 TARGET_COLS 对齐
+        labels = torch.tensor([row[col] for col in TARGET_COLS], dtype=torch.float32)
+        season = torch.tensor(self.season_map[row["Season"]], dtype=torch.long)
+        state = torch.tensor(self.state_map[row["State"]], dtype=torch.long)
+        species = torch.tensor(self.species_map[row["Species"]], dtype=torch.long)
+        aux_reg = torch.tensor([row[c] for c in AUX_COLS], dtype=torch.float32)
+        return {
+            "pixel_values": img_t,
+            "labels": labels,
+            "season_label": season,
+            "state_label": state,
+            "species_label": species,
+            "aux_reg": aux_reg,
+        }
 
 
-def train_one_epoch(
-    model: CrossPVT_T2T_MambaHead,
-    backbone: nn.Module,
-    backbone_transform,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
-    cfg: TrainConfig,
-    epoch: int,
-) -> float:
-    model.train()
-    total_loss = 0.0
-    total_main = 0.0
-    total_aux = 0.0
-    pbar = tqdm(loader, desc="  训练中", leave=False, disable=not is_main_process(torch.distributed.get_rank() if torch.distributed.is_initialized() else 0))
-    if hasattr(loader, "sampler") and isinstance(getattr(loader, "sampler", None), torch.utils.data.distributed.DistributedSampler):
-        loader.sampler.set_epoch(epoch)
-    for step, (imgs, targets) in enumerate(pbar, start=1):
-        imgs = imgs.to(cfg.device, non_blocking=True)
-        targets = targets.to(cfg.device, non_blocking=True)
-        with torch.no_grad():
-            tok_small = encode_tiles(imgs, backbone, backbone_transform, cfg.small_grid)
-            tok_big = encode_tiles(imgs, backbone, backbone_transform, cfg.big_grid)
-        with autocast(enabled=cfg.device.type == "cuda"):
-            out = model(tok_small, tok_big, cfg.small_grid, return_features=False)
-            pred = pack_targets(out)
-            loss_main = smooth_l1_loss(pred, targets, smooth=cfg.label_smooth)
-            loss_aux = 0.0
-            if cfg.aux_head and "aux" in out:
-                loss_aux = F.smooth_l1_loss(out["aux"], targets)
-            loss = loss_main + 0.4 * loss_aux
-        optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        bsz = imgs.size(0)
-        total_loss += loss.item() * bsz
-        total_main += loss_main.item() * bsz
-        total_aux += (float(loss_aux) if isinstance(loss_aux, float) else loss_aux.item()) * bsz
-        if step % max(1, cfg.log_interval) == 0:
-            pbar.set_postfix(
-                {
-                    "step": step,
-                    "loss": f"{loss.item():.4f}",
-                    "main": f"{loss_main.item():.4f}",
-                    "aux": f"{float(loss_aux):.4f}",
-                }
+def data_collator(batch):
+    pixel_values = torch.stack([b["pixel_values"] for b in batch])
+    labels = torch.stack([b["labels"] for b in batch])
+    season_label = torch.stack([b["season_label"] for b in batch])
+    state_label = torch.stack([b["state_label"] for b in batch])
+    species_label = torch.stack([b["species_label"] for b in batch])
+    aux_reg = torch.stack([b["aux_reg"] for b in batch])
+    return {
+        "pixel_values": pixel_values,
+        "labels": labels,
+        "labels_main": labels,
+        "season_label": season_label,
+        "state_label": state_label,
+        "species_label": species_label,
+        "aux_reg": aux_reg,
+    }
+
+
+# =============================================================================
+# 模型包装给 Trainer
+# =============================================================================
+class HFWrapper(nn.Module):
+    def __init__(self, cfg: HFConfig, backbone: nn.Module, backbone_transform):
+        super().__init__()
+        self.cfg = cfg
+        self.backbone = backbone
+        self.backbone_transform = backbone_transform
+        # hint Trainer to ignore frozen backbone params when saving
+        self._keys_to_ignore_on_save = ["backbone"]
+        self.head = CrossPVT_T2T_MambaHead(
+            HFConfig(
+                dropout=cfg.dropout,
+                hidden_ratio=cfg.hidden_ratio,
+                aux_head=cfg.aux_head,
+                small_grid=cfg.small_grid,
+                big_grid=cfg.big_grid,
+                pyramid_dims=cfg.pyramid_dims,
+                mamba_depth=cfg.mamba_depth,
+                mamba_kernel=cfg.mamba_kernel,
+                mobilevit_heads=cfg.mobilevit_heads,
+                mobilevit_depth=cfg.mobilevit_depth,
+                sra_heads=cfg.sra_heads,
+                sra_ratio=cfg.sra_ratio,
+                cross_heads=cfg.cross_heads,
+                cross_layers=cfg.cross_layers,
+                t2t_depth=cfg.t2t_depth,
+                vit_name=cfg.vit_name,
+                vit_checkpoint=cfg.vit_checkpoint,
+                vit_feat_dim=4096,
+                token_embed_dim=1024,
             )
-    n = len(loader.dataset)
-    return total_loss / n
+        )
+        self.loss_aux_w = 0.4
+        self.label_smooth = cfg.label_smooth
+        if cfg.output_mode not in OUTPUT_MODES:
+            raise ValueError(f"Unknown output_mode: {cfg.output_mode}")
+        self.base_cols = OUTPUT_MODES[cfg.output_mode]
+        self.loss_season_w = cfg.loss_season_w
+        self.loss_state_w = cfg.loss_state_w
+        self.loss_species_w = cfg.loss_species_w
+        self.loss_ndvi_w = cfg.loss_ndvi_w
+        self.loss_height_w = cfg.loss_height_w
+
+    def _maybe_log1p_targets(self, targets: torch.Tensor) -> torch.Tensor:
+        if not self.cfg.log1p_targets:
+            return targets
+        return torch.log1p(torch.clamp(targets, min=0))
+
+    def _maybe_expm1_preds(self, preds: torch.Tensor) -> torch.Tensor:
+        if not self.cfg.log1p_targets:
+            return preds
+        return torch.expm1(preds)
+
+    def _derive_targets(self, preds: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        green = preds.get("Dry_Green_g")
+        clover = preds.get("Dry_Clover_g")
+        dead = preds.get("Dry_Dead_g")
+        gdm = preds.get("GDM_g")
+        total = preds.get("Dry_Total_g")
+
+        if self.cfg.output_mode == "exp1":
+            gdm = green + clover
+            total = green + clover + dead
+        elif self.cfg.output_mode == "exp2":
+            gdm = clover + green
+            dead = total - gdm
+        elif self.cfg.output_mode == "exp3":
+            clover = total - (dead + green)
+            gdm = clover + green
+        elif self.cfg.output_mode == "exp4":
+            green = gdm - clover
+            total = gdm + dead
+        elif self.cfg.output_mode == "exp5":
+            clover = gdm - green
+            total = gdm + dead
+        elif self.cfg.output_mode == "exp6":
+            green = gdm - clover
+            dead = total - (clover + green)
+        elif self.cfg.output_mode == "exp7":
+            clover = gdm - green
+            dead = total - (clover + green)
+
+        if self.cfg.nonneg_clamp:
+            green = F.relu(green)
+            clover = F.relu(clover)
+            dead = F.relu(dead)
+            gdm = F.relu(gdm)
+            total = F.relu(total)
+
+        return {
+            "Dry_Green_g": green,
+            "Dry_Dead_g": dead,
+            "Dry_Clover_g": clover,
+            "GDM_g": gdm,
+            "Dry_Total_g": total,
+        }
+
+    def forward(
+        self,
+        pixel_values=None,
+        labels=None,
+        labels_main=None,
+        season_label=None,
+        state_label=None,
+        species_label=None,
+        aux_reg=None,
+    ):
+        tok_small = encode_tiles(pixel_values, self.backbone, self.backbone_transform, self.cfg.small_grid)
+        tok_big = encode_tiles(pixel_values, self.backbone, self.backbone_transform, self.cfg.big_grid)
+        out = self.head(tok_small, tok_big, self.cfg.small_grid, return_features=False)
+
+        raw_preds = out["preds"]
+        base_preds_raw = {k: raw_preds[k] for k in self.base_cols}
+        preds_linear = {k: self._maybe_expm1_preds(v) for k, v in raw_preds.items()}
+        full_preds = self._derive_targets(preds_linear)
+        logits_result = torch.cat([full_preds[c] for c in TARGET_COLS], dim=1)
+        result = {"logits": logits_result}
+        if labels is not None:
+            idxs = [TARGET_COLS.index(c) for c in self.base_cols]
+            target_source = labels_main if labels_main is not None else labels
+            target_base = self._maybe_log1p_targets(target_source[:, idxs])
+            pred_base = torch.cat(
+                [base_preds_raw[c] if self.cfg.log1p_targets else preds_linear[c] for c in self.base_cols], dim=1
+            )
+            loss_main = F.smooth_l1_loss(pred_base, target_base, beta=self.label_smooth)
+            loss_aux = 0.0
+            if self.cfg.aux_head and "aux" in out:
+                target_aux = self._maybe_log1p_targets(target_source)
+                loss_aux = F.smooth_l1_loss(out["aux"], target_aux)
+            loss_cls = 0.0
+            if season_label is not None and self.loss_season_w > 0:
+                loss_cls += self.loss_season_w * F.cross_entropy(out["season_logits"], season_label)
+            if state_label is not None and self.loss_state_w > 0:
+                loss_cls += self.loss_state_w * F.cross_entropy(out["state_logits"], state_label)
+            if species_label is not None and self.loss_species_w > 0:
+                loss_cls += self.loss_species_w * F.cross_entropy(out["species_logits"], species_label)
+            loss_reg = 0.0
+            if aux_reg is not None:
+                if self.loss_ndvi_w > 0:
+                    loss_reg += self.loss_ndvi_w * F.smooth_l1_loss(out["aux_reg"][:, 0], aux_reg[:, 0])
+                if self.loss_height_w > 0:
+                    loss_reg += self.loss_height_w * F.smooth_l1_loss(out["aux_reg"][:, 1], aux_reg[:, 1])
+            loss = loss_main + self.loss_aux_w * loss_aux + loss_cls + loss_reg
+            result["loss"] = loss
+        return result
+
+    def state_dict(self, *args, **kwargs):
+        # 保存时排除 backbone 权重，避免巨大的 7B 体积
+        sd = super().state_dict(*args, **kwargs)
+        return {k: v for k, v in sd.items() if not k.startswith("backbone.")}
+
+    def load_state_dict(self, state_dict, strict: bool = False):
+        # 加载时忽略缺失的 backbone 键，确保兼容过滤后的 state_dict
+        filtered = {k: v for k, v in state_dict.items() if not k.startswith("backbone.")}
+        return super().load_state_dict(filtered, strict=False)
 
 
-@torch.no_grad()
-def evaluate(
-    model: CrossPVT_T2T_MambaHead,
-    backbone: nn.Module,
-    backbone_transform,
-    loader: DataLoader,
-    cfg: TrainConfig,
-) -> float:
-    model.eval()
-    total_loss = 0.0
-    total_count = 0
-    for imgs, targets in loader:
-        imgs = imgs.to(cfg.device, non_blocking=True)
-        targets = targets.to(cfg.device, non_blocking=True)
-        tok_small = encode_tiles(imgs, backbone, backbone_transform, cfg.small_grid)
-        tok_big = encode_tiles(imgs, backbone, backbone_transform, cfg.big_grid)
-        out = model(tok_small, tok_big, cfg.small_grid, return_features=False)
-        pred = pack_targets(out)
-        loss_main = smooth_l1_loss(pred, targets, smooth=cfg.label_smooth)
-        loss_aux = 0.0
-        if cfg.aux_head and "aux" in out:
-            loss_aux = F.smooth_l1_loss(out["aux"], targets)
-        loss = loss_main + 0.4 * loss_aux
-        bsz = imgs.size(0)
-        total_loss += loss.item() * bsz
-        total_count += bsz
-    if torch.distributed.is_initialized():
-        loss_tensor = torch.tensor([total_loss, total_count], device=cfg.device, dtype=torch.float32)
-        torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.SUM)
-        total_loss, total_count = loss_tensor.tolist()
-    return total_loss / max(1, total_count)
+# =============================================================================
+# 评估指标（加权 R²）
+# =============================================================================
+def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
+    preds = eval_pred.predictions
+    if isinstance(preds, tuple):
+        preds = preds[0]
+    label_ids = eval_pred.label_ids
+    if isinstance(label_ids, dict):
+        if "labels_main" in label_ids:
+            label_ids = label_ids["labels_main"]
+        elif "labels" in label_ids:
+            label_ids = label_ids["labels"]
+        else:
+            label_ids = next(iter(label_ids.values()), None)
+    elif isinstance(label_ids, (list, tuple)):
+        label_ids = next((x for x in label_ids if hasattr(x, "shape")), None)
+    if label_ids is None:
+        return {}
 
+    y_pred = torch.as_tensor(preds, dtype=torch.float32)
+    y_true = torch.as_tensor(label_ids, dtype=torch.float32)
 
-@torch.no_grad()
-def evaluate_r2(
-    model: CrossPVT_T2T_MambaHead,
-    backbone: nn.Module,
-    backbone_transform,
-    loader: DataLoader,
-    cfg: TrainConfig,
-) -> float:
-    model.eval()
-    preds: List[torch.Tensor] = []
-    trues: List[torch.Tensor] = []
-    w_base = torch.tensor([WEIGHTS[c] for c in TARGET_COLS], device=cfg.device, dtype=torch.float32)
-    for imgs, targets in loader:
-        imgs = imgs.to(cfg.device, non_blocking=True)
-        targets = targets.to(cfg.device, non_blocking=True)
-        tok_small = encode_tiles(imgs, backbone, backbone_transform, cfg.small_grid)
-        tok_big = encode_tiles(imgs, backbone, backbone_transform, cfg.big_grid)
-        out = model(tok_small, tok_big, cfg.small_grid, return_features=False)
-        pred = pack_targets(out)
-        preds.append(pred)
-        trues.append(targets)
-
-    y_true = torch.cat(trues, dim=0)
-    y_pred = torch.cat(preds, dim=0)
-
+    w_base = torch.tensor([WEIGHTS[c] for c in TARGET_COLS], dtype=torch.float32)
     w = w_base.unsqueeze(0).expand(y_true.size(0), -1)
     w_flat = w.reshape(-1)
     y_true_flat = y_true.reshape(-1)
@@ -904,7 +951,7 @@ def evaluate_r2(
     r2 = 1.0 - (ss_res / ss_tot)
 
     total_res = 0.0
-    summary = []
+    summary: List[tuple[str, float, float]] = []
     for idx, name in enumerate(TARGET_COLS):
         wt = WEIGHTS[name]
         y_t = y_true[:, idx]
@@ -922,133 +969,143 @@ def evaluate_r2(
             tot_share = tot / tot_sum
             print(f"    {name}: res_share={res_share:.3f}, tot_share={tot_share:.3f}")
 
-    return float(r2)
-
-
-def save_checkpoint(
-    model: CrossPVT_T2T_MambaHead,
-    optimizer: torch.optim.Optimizer,
-    cfg: TrainConfig,
-    epoch: int,
-    fold: int,
-    val_loss: float,
-) -> None:
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    path = cfg.output_dir / f"fold{fold}_epoch{epoch}_loss{val_loss:.4f}.pt"
-    state = {
-        "epoch": epoch,
-        "fold": fold,
-        "val_loss": val_loss,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "cfg": cfg,
-    }
-    torch.save(state, path)
+    return {"weighted_r2": float(r2)}
 
 
 # =============================================================================
-# Entry
+# 主流程
 # =============================================================================
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train single-branch CrossPVT T2T Mamba with ViT-7B features")
-    p.add_argument("--train-csv", type=Path, default=TrainConfig.train_csv, help="path to train.csv")
-    p.add_argument("--image-dir", type=Path, default=TrainConfig.image_dir, help="path to train image directory")
-    p.add_argument("--output-dir", type=Path, default=TrainConfig.output_dir, help="where to save checkpoints")
-    p.add_argument("--epochs", type=int, default=TrainConfig.num_epochs, help="num epochs per fold")
-    p.add_argument("--batch-size", type=int, default=TrainConfig.batch_size, help="batch size")
-    p.add_argument("--num-workers", type=int, default=TrainConfig.num_workers, help="dataloader workers")
-    p.add_argument("--lr", type=float, default=TrainConfig.lr, help="learning rate")
-    p.add_argument("--weight-decay", type=float, default=TrainConfig.weight_decay, help="weight decay")
-    p.add_argument("--no-aux", action="store_true", help="disable auxiliary head")
-    p.add_argument("--folds", type=str, default="0,1,2,3,4", help="comma-separated folds to run")
-    p.add_argument("--seed", type=int, default=SEED, help="random seed")
-    p.add_argument("--log-interval", type=int, default=TrainConfig.log_interval, help="steps between tqdm postfix updates")
-    p.add_argument("--no-backbone-dp", action="store_true", help="禁用 ViT DataParallel（多卡特征提取）")
-    return p.parse_args()
+def parse_args():
+    ap = argparse.ArgumentParser(description="Train with HF Trainer")
+    ap.add_argument("--train-csv", type=Path, default=HFConfig.train_csv)
+    ap.add_argument("--image-dir", type=Path, default=HFConfig.image_dir)
+    ap.add_argument("--output-dir", type=Path, default=HFConfig.output_dir)
+    ap.add_argument("--folds", type=str, default="0,1,2,3,4")
+    ap.add_argument("--epochs", type=int, default=HFConfig.epochs)
+    ap.add_argument("--batch-size", type=int, default=HFConfig.batch_size)
+    ap.add_argument("--num-workers", type=int, default=HFConfig.num_workers)
+    ap.add_argument("--lr", type=float, default=HFConfig.lr)
+    ap.add_argument("--weight-decay", type=float, default=HFConfig.weight_decay)
+    ap.add_argument("--dropout", type=float, default=HFConfig.dropout)
+    ap.add_argument("--hidden-ratio", type=float, default=HFConfig.hidden_ratio)
+    ap.add_argument("--no-aux", action="store_true")
+    ap.add_argument("--bf16", action="store_true")
+    ap.add_argument("--output-mode", type=str, default=HFConfig.output_mode, choices=sorted(OUTPUT_MODES.keys()))
+    ap.add_argument("--no-nonneg-clamp", action="store_true")
+    ap.add_argument("--loss-season-w", type=float, default=HFConfig.loss_season_w)
+    ap.add_argument("--loss-state-w", type=float, default=HFConfig.loss_state_w)
+    ap.add_argument("--loss-species-w", type=float, default=HFConfig.loss_species_w)
+    ap.add_argument("--loss-ndvi-w", type=float, default=HFConfig.loss_ndvi_w)
+    ap.add_argument("--loss-height-w", type=float, default=HFConfig.loss_height_w)
+    ap.add_argument("--log1p-targets", action="store_true", help="train regression heads in log1p space")
+    return ap.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
-    rank, world_size, local_rank = init_distributed()
-    if torch.cuda.is_available():
-        if local_rank is not None:
-            torch.cuda.set_device(local_rank)
-    set_seed(args.seed + rank)
-    cfg = TrainConfig(
+    accelerator = Accelerator()
+    device = accelerator.device
+
+    folds = tuple(int(x) for x in str(args.folds).split(",") if x.strip() != "")
+    cfg = HFConfig(
         train_csv=args.train_csv,
         image_dir=args.image_dir,
         output_dir=args.output_dir,
-        num_epochs=args.epochs,
+        folds=folds,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        dropout=args.dropout,
+        hidden_ratio=args.hidden_ratio,
         aux_head=not args.no_aux,
-        log_interval=args.log_interval,
-        use_backbone_dp=not args.no_backbone_dp,
+        bf16=args.bf16,
+        output_mode=args.output_mode,
+        nonneg_clamp=not args.no_nonneg_clamp,
+        loss_season_w=args.loss_season_w,
+        loss_state_w=args.loss_state_w,
+        loss_species_w=args.loss_species_w,
+        loss_ndvi_w=args.loss_ndvi_w,
+        loss_height_w=args.loss_height_w,
+        log1p_targets=args.log1p_targets,
     )
+    if cfg.log1p_targets:
+        cfg.output_dir = cfg.output_dir.with_name(f"{cfg.output_dir.name}_log1p")
 
-    cfg.device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
-    if is_main_process(rank):
-        print(f">>> 分布式信息 rank/world_size/local_rank = {rank}/{world_size}/{local_rank}")
-        print(">>> 初始化 ViT 特征提取器（冻结，仅用于提取 tokens）")
-    backbone, backbone_transform = build_feature_extractor(cfg)
-    folds = [int(x) for x in str(args.folds).split(",") if x.strip() != ""]
+    # 数据划分
+    df = pd.read_csv(cfg.train_csv)
+    df = add_fold_column(df)
+    df = add_season_column(df, "Sampling_Date")
+    wide = (
+        df.pivot_table(index=["image_id", "image_path", "fold"], columns="target_name", values="target")
+        .reset_index()
+        .rename_axis(None, axis=1)
+    )
+    meta = (
+        df.drop_duplicates("image_id")[["image_id", "Season", "State", "Species", *AUX_COLS]]
+        .reset_index(drop=True)
+    )
+    wide = wide.merge(meta, on="image_id", how="left")
+    season_map = {name: idx for idx, name in enumerate(SEASON_LABELS)}
+    state_map = {name: idx for idx, name in enumerate(STATE_LABELS)}
+    species_list = sorted(df["Species"].dropna().unique().tolist())
+    species_map = {name: idx for idx, name in enumerate(species_list)}
+    if len(season_map) != cfg.season_classes:
+        raise ValueError(f"season classes mismatch: {len(season_map)} vs {cfg.season_classes}")
+    if len(state_map) != cfg.state_classes:
+        raise ValueError(f"state classes mismatch: {len(state_map)} vs {cfg.state_classes}")
+    if len(species_map) != cfg.species_classes:
+        raise ValueError(f"species classes mismatch: {len(species_map)} vs {cfg.species_classes}")
+
+    # Backbone + timm transform
+    backbone, backbone_transform = build_feature_extractor(HFConfig(device=device))
 
     for fold in folds:
-        if is_main_process(rank):
-            print(f"\n===== Fold {fold} / {N_SPLITS} =====")
-            print(">>> 构建数据加载器")
-        train_loader, val_loader, val_ds = build_dataloaders(cfg, fold)
+        print(f"\n===== Fold {fold} / {len(folds)} =====")
+        train_df = wide[wide["fold"] != fold].reset_index(drop=True)
+        val_df = wide[wide["fold"] == fold].reset_index(drop=True)
 
-        if is_main_process(rank):
-            print(">>> 初始化 CrossPVT_T2T_Mamba 头部")
-        model = CrossPVT_T2T_MambaHead(cfg).to(cfg.device)
-        if world_size > 1:
-            model = torch.nn.parallel.DistributedDataParallel(
-                model, device_ids=[local_rank] if torch.cuda.is_available() else None, find_unused_parameters=True
-            )
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-        scaler = GradScaler(enabled=cfg.device.type == "cuda")
+        train_ds = BiomassHFDataset(train_df, cfg.image_dir, train=True, season_map=season_map, state_map=state_map, species_map=species_map)
+        val_ds = BiomassHFDataset(val_df, cfg.image_dir, train=False, season_map=season_map, state_map=state_map, species_map=species_map)
 
-        best_loss = float("inf")
-        best_state: Optional[dict] = None
-        for epoch in range(1, cfg.num_epochs + 1):
-            if is_main_process(rank):
-                print(f"\n  -> Epoch {epoch}/{cfg.num_epochs} 开始")
-            train_loss = train_one_epoch(model, backbone, backbone_transform, train_loader, optimizer, scaler, cfg, epoch)
-            val_loss = evaluate(model, backbone, backbone_transform, val_loader, cfg)
-            # 收集 train_loss, val_loss 到主进程做日志
-            if torch.distributed.is_initialized():
-                loss_tensor = torch.tensor([train_loss, val_loss], device=cfg.device, dtype=torch.float32)
-                torch.distributed.reduce(loss_tensor, dst=0, op=torch.distributed.ReduceOp.AVG)
-                train_loss, val_loss = loss_tensor.tolist()
-            if is_main_process(rank):
-                print(f"Fold {fold} | Epoch {epoch}/{cfg.num_epochs} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
-                if val_loss < best_loss:
-                    best_loss = val_loss
-                    # DDP 状态字典在 module 内
-                    state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-                    best_state = {k: v.detach().cpu() for k, v in state_dict.items()}
-                    save_checkpoint(model.module if hasattr(model, 'module') else model, optimizer, cfg, epoch, fold, val_loss)
+        model = HFWrapper(cfg, backbone, backbone_transform)
 
-        # R2 仅主进程计算，需加载最佳权重；使用完整 val 集合（无分布式切分）
-        if is_main_process(rank):
-            if best_state is not None:
-                target_model = model.module if hasattr(model, "module") else model
-                target_model.load_state_dict(best_state, strict=False)
-            print(f"Fold {fold} training done. Best val_loss={best_loss:.4f}. Running weighted R2...")
-            val_full_loader = DataLoader(
-                val_ds,
-                batch_size=cfg.batch_size,
-                shuffle=False,
-                num_workers=cfg.num_workers,
-                pin_memory=True,
-            )
-            val_r2 = evaluate_r2(model.module if hasattr(model, 'module') else model, backbone, val_full_loader, cfg)
-            print(f"Fold {fold} weighted R2: {val_r2:.5f}")
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        args_tr = TrainingArguments(
+            output_dir=str(cfg.output_dir / f"{cfg.output_mode}_fold_{fold}"),
+            per_device_train_batch_size=cfg.batch_size,
+            per_device_eval_batch_size=cfg.batch_size,
+            num_train_epochs=cfg.epochs,
+            learning_rate=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            dataloader_num_workers=cfg.num_workers,
+            logging_steps=15,
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            bf16=cfg.bf16,
+            fp16=not cfg.bf16,
+            save_total_limit=10,
+            load_best_model_at_end=True,
+            lr_scheduler_type="cosine",
+            warmup_steps = 100,
+            metric_for_best_model="weighted_r2",
+            greater_is_better=True,
+            report_to="tensorboard",
+        )
+
+        trainer = Trainer(
+            model=model,
+            args=args_tr,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            data_collator=data_collator,
+            compute_metrics=compute_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=8)],
+        )
+
+        trainer.train()
+        metrics = trainer.evaluate()
+        print(f"Fold {fold} eval metrics: {metrics}")
 
 
 if __name__ == "__main__":

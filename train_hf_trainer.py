@@ -37,6 +37,15 @@ WEIGHTS = {
     "GDM_g": 0.2,
     "Dry_Total_g": 0.5,
 }
+OUTPUT_MODES: Dict[str, Tuple[str, str, str]] = {
+    "exp1": ("Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g"),
+    "exp2": ("Dry_Clover_g", "Dry_Total_g", "Dry_Green_g"),
+    "exp3": ("Dry_Total_g", "Dry_Dead_g", "Dry_Green_g"),
+    "exp4": ("GDM_g", "Dry_Clover_g", "Dry_Dead_g"),
+    "exp5": ("GDM_g", "Dry_Green_g", "Dry_Dead_g"),
+    "exp6": ("Dry_Clover_g", "Dry_Total_g", "GDM_g"),
+    "exp7": ("Dry_Green_g", "Dry_Total_g", "GDM_g"),
+}
 
 # =============================================================================
 # Fold helpers (ported from fold_split.ipynb)
@@ -484,10 +493,15 @@ class CrossPVT_T2T_MambaHead(nn.Module):
                 nn.Linear(hidden, 1),
             )
 
-        self.head_green = head()
-        self.head_clover = head()
-        self.head_dead = head()
-        self.score_head = nn.Sequential(nn.LayerNorm(combined), nn.Linear(combined, 1))
+        self.heads = nn.ModuleDict(
+            {
+                "Dry_Green_g": head(),
+                "Dry_Clover_g": head(),
+                "Dry_Dead_g": head(),
+                "GDM_g": head(),
+                "Dry_Total_g": head(),
+            }
+        )
         self.aux_head = (
             nn.Sequential(nn.LayerNorm(cfg.pyramid_dims[1]), nn.Linear(cfg.pyramid_dims[1], len(TARGET_COLS)))
             if cfg.aux_head
@@ -510,17 +524,8 @@ class CrossPVT_T2T_MambaHead(nn.Module):
         feat, feat_maps = self.pyramid(fused)
         feat_maps["stage1_map"] = stage1_map
 
-        green_pos = self.softplus(self.head_green(feat))
-        clover_pos = self.softplus(self.head_clover(feat))
-        dead_pos = self.softplus(self.head_dead(feat))
-
-
-        out: Dict[str, torch.Tensor] = {
-            "green": green_pos,
-            "dead": dead_pos,
-            "clover": clover_pos,
-            "score_feat": feat,
-        }
+        preds = {k: self.softplus(head(feat)) for k, head in self.heads.items()}
+        out: Dict[str, torch.Tensor] = {"preds": preds, "score_feat": feat}
         if self.aux_head is not None:
             aux_tokens = feat_maps["stage2_tokens"]
             aux_pred = self.softplus(self.aux_head(aux_tokens.mean(dim=1)))
@@ -551,6 +556,8 @@ class HFConfig:
     aux_head: bool = True
     label_smooth: float = 0.0
     bf16: bool = False
+    output_mode: str = "exp1"
+    nonneg_clamp: bool = True
 
     small_grid: Tuple[int, int] = (2, 4)
     big_grid: Tuple[int, int] = (1, 2)
@@ -729,24 +736,68 @@ class HFWrapper(nn.Module):
         )
         self.loss_aux_w = 0.4
         self.label_smooth = cfg.label_smooth
+        if cfg.output_mode not in OUTPUT_MODES:
+            raise ValueError(f"Unknown output_mode: {cfg.output_mode}")
+        self.base_cols = OUTPUT_MODES[cfg.output_mode]
+
+    def _derive_targets(self, preds: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        green = preds.get("Dry_Green_g")
+        clover = preds.get("Dry_Clover_g")
+        dead = preds.get("Dry_Dead_g")
+        gdm = preds.get("GDM_g")
+        total = preds.get("Dry_Total_g")
+
+        if self.cfg.output_mode == "exp1":
+            gdm = green + clover
+            total = green + clover + dead
+        elif self.cfg.output_mode == "exp2":
+            gdm = clover + green
+            dead = total - gdm
+        elif self.cfg.output_mode == "exp3":
+            clover = total - (dead + green)
+            gdm = clover + green
+        elif self.cfg.output_mode == "exp4":
+            green = gdm - clover
+            total = gdm + dead
+        elif self.cfg.output_mode == "exp5":
+            clover = gdm - green
+            total = gdm + dead
+        elif self.cfg.output_mode == "exp6":
+            green = gdm - clover
+            dead = total - (clover + green)
+        elif self.cfg.output_mode == "exp7":
+            clover = gdm - green
+            dead = total - (clover + green)
+
+        if self.cfg.nonneg_clamp:
+            green = F.relu(green)
+            clover = F.relu(clover)
+            dead = F.relu(dead)
+            gdm = F.relu(gdm)
+            total = F.relu(total)
+
+        return {
+            "Dry_Green_g": green,
+            "Dry_Dead_g": dead,
+            "Dry_Clover_g": clover,
+            "GDM_g": gdm,
+            "Dry_Total_g": total,
+        }
 
     def forward(self, pixel_values=None, labels=None):
         tok_small = encode_tiles(pixel_values, self.backbone, self.backbone_transform, self.cfg.small_grid)
         tok_big = encode_tiles(pixel_values, self.backbone, self.backbone_transform, self.cfg.big_grid)
         out = self.head(tok_small, tok_big, self.cfg.small_grid, return_features=False)
 
-        green = out["green"]
-        clover = out["clover"]
-        dead = out["dead"]
-
-        gdm = green + clover
-        total = green + clover + dead
-
-        logits_loss = torch.cat([green, dead, clover], dim=1)
-        logits_result = torch.cat([green, dead, clover, gdm, total], dim=1)
+        base_preds = {k: out["preds"][k] for k in self.base_cols}
+        full_preds = self._derive_targets({**out["preds"], **base_preds})
+        logits_result = torch.cat([full_preds[c] for c in TARGET_COLS], dim=1)
         result = {"logits": logits_result}
         if labels is not None:
-            loss_main = F.smooth_l1_loss(logits_loss, labels[:,:3], beta=self.label_smooth)
+            idxs = [TARGET_COLS.index(c) for c in self.base_cols]
+            target_base = labels[:, idxs]
+            pred_base = torch.cat([base_preds[c] for c in self.base_cols], dim=1)
+            loss_main = F.smooth_l1_loss(pred_base, target_base, beta=self.label_smooth)
             loss_aux = 0.0
             if self.cfg.aux_head and "aux" in out:
                 loss_aux = F.smooth_l1_loss(out["aux"], labels)
@@ -827,6 +878,8 @@ def parse_args():
     ap.add_argument("--hidden-ratio", type=float, default=HFConfig.hidden_ratio)
     ap.add_argument("--no-aux", action="store_true")
     ap.add_argument("--bf16", action="store_true")
+    ap.add_argument("--output-mode", type=str, default=HFConfig.output_mode, choices=sorted(OUTPUT_MODES.keys()))
+    ap.add_argument("--no-nonneg-clamp", action="store_true")
     return ap.parse_args()
 
 
@@ -850,6 +903,8 @@ def main():
         hidden_ratio=args.hidden_ratio,
         aux_head=not args.no_aux,
         bf16=args.bf16,
+        output_mode=args.output_mode,
+        nonneg_clamp=not args.no_nonneg_clamp,
     )
 
     # 数据划分
@@ -875,22 +930,24 @@ def main():
         model = HFWrapper(cfg, backbone, backbone_transform)
 
         args_tr = TrainingArguments(
-            output_dir=str(cfg.output_dir / f"fold{fold}"),
+            output_dir=str(cfg.output_dir / f"{cfg.output_mode}_fold_{fold}"),
             per_device_train_batch_size=cfg.batch_size,
             per_device_eval_batch_size=cfg.batch_size,
             num_train_epochs=cfg.epochs,
             learning_rate=cfg.lr,
             weight_decay=cfg.weight_decay,
             dataloader_num_workers=cfg.num_workers,
-            logging_steps=20,
+            logging_steps=15,
             eval_strategy="epoch",
             save_strategy="epoch",
             bf16=cfg.bf16,
             fp16=not cfg.bf16,
-            save_total_limit=20,
+            save_total_limit=10,
             load_best_model_at_end=True,
-            metric_for_best_model="weighted_r2",
-            greater_is_better=True,
+            lr_scheduler_type="cosine",
+            warmup_steps = 100,
+            # metric_for_best_model="weighted_r2",
+            # greater_is_better=True,
             report_to="tensorboard",
         )
 
